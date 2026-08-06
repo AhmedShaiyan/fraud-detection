@@ -1,0 +1,38 @@
+# Docs and markdown (internal planning notes, not for the public repo)
+*.md
+docs/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated data / Parquet bridge-test artifacts (producer.py --parquet-out)
+out/
+*.parquet
+
+# Airflow 
+airflow/logs/
+*.log
+
+# dbt 
+target/
+dbt_packages/
+
+# MLflow 
+mlruns/
+
+# OS /
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

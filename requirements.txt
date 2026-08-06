@@ -1,0 +1,5 @@
+# Local producer service (see CLAUDE.md: pinned requirements.txt per service)
+confluent-kafka==2.6.1
+faker==30.8.2
+pyarrow==18.1.0
+pytest==8.3.4
