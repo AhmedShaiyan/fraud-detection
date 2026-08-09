@@ -1,6 +1,5 @@
--- AUTH-side events only. auth_transaction_id is excluded: it's always null
--- on AUTH rows (producer.py base_txn sets it to None; only SETTLEMENT
--- populates it to reference back to the originating auth).
+-- AUTH-side events only
+
 
 with source as (
 
@@ -35,9 +34,7 @@ select
     _ingested_at,
     _source_file,
 
-    -- LEAKAGE WARNING: is_fraud/fraud_type are ground-truth labels, kept
-    -- here only for offline evaluation. Never join these into a feature
-    -- table used at inference time.
+    -- LEAKAGE WARNING: is_fraud/fraud_type are ground-truth labels
     is_fraud,
     fraud_type
 

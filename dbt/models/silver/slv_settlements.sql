@@ -1,6 +1,5 @@
 -- SETTLEMENT-side events only. lat/lon/channel/pos_entry_mode/card_present/
--- auth_code are excluded: producer.py's decide_settlement/orphan_settlement
--- leave them null (those fields only make sense at the point of authorization).
+-- auth_code are excluded
 
 with source as (
 

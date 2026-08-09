@@ -16,7 +16,7 @@ __pycache__/
 venv/
 env/
 
-# Generated data / Parquet bridge-test artifacts (producer.py --parquet-out)
+# Generated data / Parquet bridge-test artifacts
 out/
 *.parquet
 
