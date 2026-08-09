@@ -1,0 +1,73 @@
+version: 2
+
+sources:
+  - name: bronze
+    database: fraud
+    schema: bronze
+    description: >
+      Raw landing tables loaded by COPY INTO from the Airflow ingest DAG.
+      Not modeled by dbt; typing and cleanup happen in Silver.
+    tables:
+      - name: transactions_raw
+        description: >
+          Unified AUTH + SETTLEMENT event stream as landed from the
+          producer's Parquet bridge files. One row per event; event_type
+          discriminates AUTH vs SETTLEMENT. Columns unused by an event type
+          are null (see producer.py EVENT_FIELDS). Schema confirmed via
+          DESCRIBE TABLE fraud.bronze.transactions_raw.
+        columns:
+          - name: transaction_id
+            data_type: string
+          - name: event_type
+            data_type: string
+          - name: event_time
+            data_type: string
+            description: ISO-8601 UTC timestamp landed as text; cast in Silver.
+          - name: auth_transaction_id
+            data_type: string
+            description: Populated on SETTLEMENT only; references the originating AUTH.
+          - name: card_id
+            data_type: string
+            description: Raw card identifier. PII — never expose past Bronze; Silver hashes it.
+          - name: merchant_id
+            data_type: string
+          - name: merchant_name
+            data_type: string
+          - name: mcc
+            data_type: string
+          - name: mcc_description
+            data_type: string
+          - name: amount
+            data_type: double
+          - name: currency
+            data_type: string
+          - name: country
+            data_type: string
+          - name: lat
+            data_type: double
+            description: Populated on AUTH only.
+          - name: lon
+            data_type: double
+            description: Populated on AUTH only.
+          - name: channel
+            data_type: string
+            description: Populated on AUTH only.
+          - name: pos_entry_mode
+            data_type: string
+            description: Populated on AUTH only.
+          - name: card_present
+            data_type: boolean
+            description: Populated on AUTH only.
+          - name: auth_code
+            data_type: string
+            description: Populated on AUTH only.
+          - name: is_fraud
+            data_type: tinyint
+          - name: fraud_type
+            data_type: string
+          - name: _ingested_at
+            data_type: timestamp
+            description: Load-time metadata added by COPY INTO; drives Silver's incremental filter.
+          - name: _source_file
+            data_type: string
+            description: Load-time metadata added by COPY INTO; the landed Parquet file path.

@@ -1,0 +1,4 @@
+# dbt for the Databricks lakehouse layer (CLAUDE.md: pinned requirements.txt per service).
+# Installs a compatible dbt-core automatically; verify the latest patch on
+# PyPI if this pin conflicts with another dbt adapter in your environment.
+dbt-databricks==1.9.4

@@ -1,0 +1,25 @@
+name: 'fraud_detection'
+version: '1.0.0'
+config-version: 2
+
+profile: 'fraud_detection'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  fraud_detection:
+    silver:
+      +materialized: incremental
+      +incremental_strategy: merge
+      +unique_key: transaction_id
+      +schema: silver
+      +on_schema_change: fail

@@ -1,0 +1,55 @@
+version: 2
+
+models:
+  - name: slv_authorizations
+    description: >
+      One row per AUTH event, typed and card_id hashed. Incremental, merged
+      on transaction_id.
+    columns:
+      - name: transaction_id
+        data_tests:
+          - unique
+          - not_null
+      - name: event_time
+        data_tests:
+          - not_null
+      - name: card_id_hash
+        data_tests:
+          - not_null
+      - name: currency
+        data_tests:
+          - accepted_values:
+              values: ['SGD', 'MYR', 'IDR', 'THB', 'USD', 'GBP', 'AUD']
+      - name: channel
+        data_tests:
+          - accepted_values:
+              values: ['POS', 'ONLINE', 'ATM', 'CONTACTLESS']
+
+  - name: slv_settlements
+    description: >
+      One row per SETTLEMENT event, typed and card_id hashed. Incremental,
+      merged on transaction_id. ~0.5% of rows are orphan force-posts whose
+      auth_transaction_id matches no real AUTH (see relationships test below).
+    columns:
+      - name: transaction_id
+        data_tests:
+          - unique
+          - not_null
+      - name: event_time
+        data_tests:
+          - not_null
+      - name: card_id_hash
+        data_tests:
+          - not_null
+      - name: currency
+        data_tests:
+          - accepted_values:
+              values: ['SGD', 'MYR', 'IDR', 'THB', 'USD', 'GBP', 'AUD']
+      - name: auth_transaction_id
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('slv_authorizations')
+              field: transaction_id
+              config:
+                severity: warn
