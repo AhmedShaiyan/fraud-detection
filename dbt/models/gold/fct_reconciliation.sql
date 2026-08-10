@@ -92,12 +92,28 @@ classified as (
 
     select
         *,
-        -- AMOUNT_MISMATCH break conditions (independent; both can fire):
-        --   pct   - drift is more than $1 AND more than recon_amount_tolerance_pct of the auth amount
-        --   ceil  - drift exceeds the absolute dollar-exposure ceiling, regardless of percentage
+        -- AMOUNT_MISMATCH break conditions (independent; either or both can fire):
+        --   cond_pct_exceeded     - drift is more than $1 AND more than recon_amount_tolerance_pct of the auth amount
+        --   cond_ceiling_exceeded - drift exceeds the absolute dollar-exposure ceiling, regardless of percentage
         (abs(amount_diff) > 1.00 and abs(amount_diff_pct) > {{ var('recon_amount_tolerance_pct', 0.10) }}) as cond_pct_exceeded,
         (abs(amount_diff) > {{ var('recon_amount_ceiling_abs', 100.00) }}) as cond_ceiling_exceeded
     from enriched
+
+),
+
+statused as (
+
+    select
+        *,
+        case
+            when has_auth and auth_code <> '00' then 'AUTH_DECLINED'
+            when has_auth and has_settlement and (cond_pct_exceeded or cond_ceiling_exceeded) then 'AMOUNT_MISMATCH'
+            when has_auth and has_settlement then 'MATCHED'
+            when has_auth and not has_settlement and is_matured then 'AUTH_NO_SETTLEMENT'
+            when has_auth and not has_settlement and not is_matured then 'PENDING_SETTLEMENT'
+            when not has_auth and has_settlement then 'ORPHAN_SETTLEMENT'
+        end as recon_status
+    from classified
 
 )
 
@@ -113,36 +129,18 @@ select
     auth_time,
     settlement_time,
     settlement_lag_minutes,
+    recon_status,
+    recon_status in ('AMOUNT_MISMATCH', 'AUTH_NO_SETTLEMENT', 'ORPHAN_SETTLEMENT') as is_break,
 
     case
-        when has_auth and auth_code <> '00' then 'AUTH_DECLINED'
-        when has_auth and has_settlement and (cond_pct_exceeded or cond_ceiling_exceeded) then 'AMOUNT_MISMATCH'
-        when has_auth and has_settlement then 'MATCHED'
-        when has_auth and not has_settlement and is_matured then 'AUTH_NO_SETTLEMENT'
-        when has_auth and not has_settlement and not is_matured then 'PENDING_SETTLEMENT'
-        when not has_auth and has_settlement then 'ORPHAN_SETTLEMENT'
-    end as recon_status,
-
-    (
-        case
-            when has_auth and auth_code <> '00' then 'AUTH_DECLINED'
-            when has_auth and has_settlement and (cond_pct_exceeded or cond_ceiling_exceeded) then 'AMOUNT_MISMATCH'
-            when has_auth and has_settlement then 'MATCHED'
-            when has_auth and not has_settlement and is_matured then 'AUTH_NO_SETTLEMENT'
-            when has_auth and not has_settlement and not is_matured then 'PENDING_SETTLEMENT'
-            when not has_auth and has_settlement then 'ORPHAN_SETTLEMENT'
-        end
-    ) in ('AMOUNT_MISMATCH', 'AUTH_NO_SETTLEMENT', 'ORPHAN_SETTLEMENT') as is_break,
-
-    case
-        when has_auth and has_settlement and cond_pct_exceeded and cond_ceiling_exceeded then 'PCT_AND_CEILING'
-        when has_auth and has_settlement and cond_pct_exceeded then 'PCT_EXCEEDED'
-        when has_auth and has_settlement and cond_ceiling_exceeded then 'CEILING_EXCEEDED'
-        when has_auth and not has_settlement and is_matured then 'SETTLEMENT_TIMEOUT'
-        when not has_auth and has_settlement then 'NO_MATCHING_AUTH'
+        when recon_status = 'AMOUNT_MISMATCH' and cond_pct_exceeded and cond_ceiling_exceeded then 'PCT_AND_CEILING'
+        when recon_status = 'AMOUNT_MISMATCH' and cond_pct_exceeded then 'PCT_EXCEEDED'
+        when recon_status = 'AMOUNT_MISMATCH' and cond_ceiling_exceeded then 'CEILING_EXCEEDED'
+        when recon_status = 'AUTH_NO_SETTLEMENT' then 'SETTLEMENT_TIMEOUT'
+        when recon_status = 'ORPHAN_SETTLEMENT' then 'NO_MATCHING_AUTH'
         else null
     end as break_reason,
 
     is_matured
 
-from classified
+from statused

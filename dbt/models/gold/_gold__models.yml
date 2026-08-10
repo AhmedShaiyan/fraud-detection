@@ -1,0 +1,30 @@
+version: 2
+
+models:
+  - name: fct_reconciliation
+    description: >
+      Auth-settlement reconciliation, full rebuild every run (see model
+      header comment for why incremental is invalid here). Grain: one row
+      per AUTH transaction plus one row per orphan SETTLEMENT.
+    columns:
+      - name: auth_transaction_id
+        description: >
+          transaction_id of the AUTH when one exists, else the (unmatched)
+          auth_transaction_id carried by an orphan SETTLEMENT. Always
+          populated by construction of the full outer join, and unique per
+          row - this is the model's coalesce/grain key.
+        data_tests:
+          - not_null
+          - unique
+      - name: recon_status
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - MATCHED
+                  - AMOUNT_MISMATCH
+                  - AUTH_NO_SETTLEMENT
+                  - PENDING_SETTLEMENT
+                  - AUTH_DECLINED
+                  - ORPHAN_SETTLEMENT
