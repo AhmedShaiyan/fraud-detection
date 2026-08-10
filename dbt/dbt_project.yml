@@ -15,6 +15,26 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
+vars:
+  # Legitimate auth->settlement drift tolerance (tips, FX conversion), as a
+  # fraction of auth_amount. Real card networks vary this by MCC (e.g.
+  # restaurants/hospitality tolerate a larger tip-driven drift than retail);
+  # flattened to one rate here as a portfolio-scale simplification of those
+  # MCC-based tolerance tables.
+  recon_amount_tolerance_pct: 0.10
+
+  # Absolute dollar-exposure ceiling on auth->settlement amount drift, applied
+  # alongside the percentage tolerance above. A small percentage drift on a
+  # large transaction can still represent real fraud/FX exposure, so cap
+  # allowed drift in absolute terms too, independent of the percentage.
+  recon_amount_ceiling_abs: 100.00
+
+  # Minutes an approved, unsettled auth stays PENDING_SETTLEMENT before it's
+  # reclassified as a break (AUTH_NO_SETTLEMENT). Real card networks hold an
+  # authorization for up to ~7 days before it expires unsettled; compressed
+  # to minutes to match the producer's compressed settlement-delay clock.
+  recon_maturity_minutes: 30
+
 models:
   fraud_detection:
     silver:
@@ -23,3 +43,5 @@ models:
       +unique_key: transaction_id
       +schema: silver
       +on_schema_change: fail
+    gold:
+      +schema: gold
