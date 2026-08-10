@@ -67,8 +67,16 @@ joined as (
 enriched as (
 
     select
-        coalesce(auth_txn_id_from_auth, auth_txn_id_from_settlement) as auth_transaction_id,
+        -- True to its name: null for ORPHAN_SETTLEMENT rows, where no auth
+        -- exists. Do not coalesce in the settlement's (unmatched)
+        -- auth_transaction_id here - that would make this column lie for
+        -- orphans to anyone joining it back to slv_authorizations.
+        auth_txn_id_from_auth as auth_transaction_id,
         settlement_transaction_id,
+        -- The grain/uniqueness key: every row has an auth_transaction_id or
+        -- a settlement_transaction_id (never neither, per the outer join),
+        -- never both referring to different things.
+        coalesce(auth_txn_id_from_auth, settlement_transaction_id) as recon_key,
         coalesce(auth_card_id_hash, settlement_card_id_hash) as card_id_hash,
         auth_amount,
         settlement_amount,
