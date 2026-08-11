@@ -35,6 +35,15 @@
 -- report has_history=false while its RANGE-based txn_count_1h/24h already
 -- count the other rows in that same burst - an inconsistency that would
 -- break the "has_history=false implies null aggregates" invariant.
+--
+-- Card-present-only implied_speed_kmh: a card-not-present (online) auth's
+-- merchant coordinates don't locate the cardholder at all - the cardholder
+-- could be anywhere, so measuring distance/time to or from a CNP row
+-- produces a physically meaningless number, mirroring how production
+-- card-network geo-velocity checks only compare physically-present
+-- transactions. implied_speed_kmh is therefore null for CNP rows and is
+-- computed against the nearest PRIOR card-present row (lag ... ignore
+-- nulls), not simply the immediately-preceding row of any kind.
 
 with auths as (
 
@@ -86,8 +95,18 @@ windowed as (
             range between 86400 preceding and 1 preceding
         )) as distinct_countries_24h,
         lag(event_time_unix) over (partition by card_id_hash order by event_time_unix) as prev_event_time_unix,
-        lag(lat) over (partition by card_id_hash order by event_time_unix) as prev_lat,
-        lag(lon) over (partition by card_id_hash order by event_time_unix) as prev_lon
+        -- Nearest PRIOR card-present row's time/lat/lon, skipping over any
+        -- CNP rows in between (see header comment) - not simply the
+        -- immediately-preceding row like prev_event_time_unix above.
+        lag(case when card_present then event_time_unix end) ignore nulls over (
+            partition by card_id_hash order by event_time_unix
+        ) as prev_present_event_time_unix,
+        lag(case when card_present then lat end) ignore nulls over (
+            partition by card_id_hash order by event_time_unix
+        ) as prev_present_lat,
+        lag(case when card_present then lon end) ignore nulls over (
+            partition by card_id_hash order by event_time_unix
+        ) as prev_present_lon
     from auths
 
 ),
@@ -109,9 +128,12 @@ features as (
         case when prev_event_time_unix is not null
             then (event_time_unix - prev_event_time_unix) / 60.0
         end as minutes_since_last_txn,
-        case when prev_event_time_unix is not null
-            then {{ haversine_km('prev_lat', 'prev_lon', 'lat', 'lon') }}
-                 / nullif((event_time_unix - prev_event_time_unix) / 3600.0, 0)
+        -- Card-present rows only, on both ends: null for CNP rows
+        -- themselves and for any row with no prior card-present event to
+        -- compare against (see header comment).
+        case when card_present and prev_present_event_time_unix is not null
+            then {{ haversine_km('prev_present_lat', 'prev_present_lon', 'lat', 'lon') }}
+                 / nullif((event_time_unix - prev_present_event_time_unix) / 3600.0, 0)
         end as implied_speed_kmh,
         card_present as is_card_present,
         (channel = 'ONLINE') as is_online,

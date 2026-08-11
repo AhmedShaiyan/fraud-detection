@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import sys
 from datetime import datetime, timedelta, timezone
@@ -34,12 +35,17 @@ def test_settlement_references_real_auth(cards, merchants):
     auth = None
     for _ in range(200):
         auth = p.generate_auth_batch(card, merchants, fraud_rate=0.0)[0]
-        settlement, _ = p.decide_settlement(auth, (2, 10))
+        settlement, _ = p.decide_settlement(auth, (2, 48))
         if settlement is not None:
             break
     assert settlement is not None, "expected at least one settlement in 200 tries"
     assert settlement["auth_transaction_id"] == auth["transaction_id"]
     assert settlement["event_type"] == "SETTLEMENT"
+
+    auth_time = datetime.fromisoformat(auth["event_time"])
+    settle_time = datetime.fromisoformat(settlement["event_time"])
+    delay_hours = (settle_time - auth_time).total_seconds() / 3600
+    assert 2 <= delay_hours <= 48, f"settlement delay {delay_hours:.2f}h outside 2-48h"
 
 
 def test_settlement_rate_approx_95_percent(cards, merchants):
@@ -49,7 +55,7 @@ def test_settlement_rate_approx_95_percent(cards, merchants):
         card = random.choice(cards)
         auth = p.generate_auth_batch(card, merchants, fraud_rate=0.0)[0]
         auth["auth_code"] = "00"  # isolate the 95%/5% split from the decline carve-out
-        settlement, _ = p.decide_settlement(auth, (2, 10))
+        settlement, _ = p.decide_settlement(auth, (2, 48))
         if settlement is not None:
             settled += 1
     rate = settled / n
@@ -57,7 +63,7 @@ def test_settlement_rate_approx_95_percent(cards, merchants):
 
 
 def test_fraud_rate_approx_1_5_percent(cards, merchants):
-    # fraud_rate is a per-decision probability (one card draw = one decision);
+    # fraud_rate is a per-decision probability (one card turn = one decision);
     # fraud generators can burst into several events, so the *event-level*
     # fraud fraction runs well above fraud_rate by design. Measure at the
     # decision level, which is what --fraud-rate actually controls.
@@ -133,12 +139,20 @@ def test_travel_mode_returns_home(cards, merchants, monkeypatch):
     assert p._normal_txn_country(card, now) == card["home_country"]
 
 
-def test_pick_available_card_skips_traveling_cards(cards, merchants):
+def test_reschedule_respects_flight_gate(cards, merchants):
+    # Regression guard for the _pick_available_card removal: a card's next
+    # scheduled turn must never land before its flight gate clears, even
+    # when the raw exponential draw would put it sooner.
+    card = cards[0]
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    traveling = cards[0]
-    traveling["next_available_at"] = now + timedelta(hours=5)
-    picked_ids = {p._pick_available_card(cards, now)["card_id"] for _ in range(50)}
-    assert traveling["card_id"] not in picked_ids
+    gate = now + timedelta(hours=19)  # e.g. a long-haul flight in progress
+    card["next_available_at"] = gate
+
+    for _ in range(200):
+        next_due = now + timedelta(seconds=p._sample_interarrival_seconds(txns_per_day_per_card=4))
+        if card["next_available_at"] is not None and card["next_available_at"] > next_due:
+            next_due = card["next_available_at"]
+        assert next_due >= gate
 
 
 def test_normal_txn_transitions_respect_flight_physics(cards, merchants):
@@ -163,15 +177,15 @@ def test_normal_txn_transitions_respect_flight_physics(cards, merchants):
 
 
 def test_generate_events_transitions_respect_flight_physics(merchants):
-    # Integration-level: exercises the real _pick_available_card fallback
-    # across many cards sharing one clock (unlike the single-card test
-    # above), which is where a card could previously get drawn again before
-    # its flight gate cleared.
+    # Integration-level: exercises the real _event_stream scheduler across
+    # many cards sharing one clock (unlike the single-card test above),
+    # which is where a card could previously get drawn again before its
+    # flight gate cleared (the _pick_available_card fallback bug).
     cards = p.build_card_pool(n_cards=30)
-    events = p.generate_events(4000, cards, merchants, fraud_rate=0.0, delay_range=(2, 10))
+    events = p.generate_events(4000, cards, merchants, fraud_rate=0.0, txns_per_day_per_card=4)
 
     # Only AUTH rows represent the card's own location; SETTLEMENT events
-    # for the same card can post minutes later at whatever country their
+    # for the same card can post hours later at whatever country their
     # originating AUTH had, unrelated to flight gating, and would otherwise
     # look like spurious teleports when interleaved into the timeline.
     auths = [e for e in events if e["event_type"] == "AUTH"]
@@ -188,6 +202,42 @@ def test_generate_events_transitions_respect_flight_physics(merchants):
                 f"{speed_kmh:.0f} km/h over {dt_hours:.2f}h - transition still teleports"
             )
         last_by_card[e["card_id"]] = e
+
+
+def test_same_country_card_present_pairs_respect_ground_speed():
+    # The blind spot the two tests above miss entirely: both only compute
+    # implied speed when the COUNTRY changes between consecutive
+    # transactions. This is the complementary, same-country case - exactly
+    # where the merchant-fixed-coordinates + short-inter-arrival-gap
+    # teleport bug was actually found (via live warehouse data, not a
+    # sweep - this test exists so a sweep would have caught it too). Swept
+    # across several seeds, matching how the original bug was surfaced.
+    checked = 0
+    for seed in range(10):
+        random.seed(seed)
+        p.Faker.seed(seed)
+        cards = p.build_card_pool(n_cards=30)
+        merchants = p.build_merchant_pool(n_merchants=60)
+        events = p.generate_events(1500, cards, merchants, fraud_rate=0.0, txns_per_day_per_card=4)
+
+        auths = [e for e in events if e["event_type"] == "AUTH" and e["card_present"]]
+        last_by_card: dict[str, dict] = {}
+        for e in sorted(auths, key=lambda e: e["event_time"]):
+            prev = last_by_card.get(e["card_id"])
+            if prev is not None and prev["country"] == e["country"]:
+                dt_hours = ((datetime.fromisoformat(e["event_time"])
+                             - datetime.fromisoformat(prev["event_time"])).total_seconds() / 3600)
+                if dt_hours > 0:
+                    dist_km = p.haversine_km(prev["lat"], prev["lon"], e["lat"], e["lon"])
+                    speed_kmh = dist_km / dt_hours
+                    checked += 1
+                    assert speed_kmh <= 900, (
+                        f"seed={seed} card={e['card_id']}: same-country ({e['country']}) "
+                        f"card-present speed {speed_kmh:.0f} km/h over {dt_hours:.2f}h"
+                    )
+            last_by_card[e["card_id"]] = e
+
+    assert checked > 50, f"only exercised {checked} same-country card-present pairs - too few to trust"
 
 
 def test_geo_impossible_still_violates_physics(cards, merchants):
@@ -213,13 +263,45 @@ def test_geo_impossible_still_violates_physics(cards, merchants):
                     - datetime.fromisoformat(t1["event_time"])).total_seconds()) / 3600
     dist_km = p.haversine_km(*p.COUNTRIES[t1["country"]][:2], *p.COUNTRIES[t2["country"]][:2])
     speed_kmh = dist_km / dt_hours if dt_hours > 0 else float("inf")
-    # 1500 km/h floor, not 2000: SG-MY (the closest country pair, 309km) at
-    # the max 10-minute gap only implies ~1854 km/h, so a 2000 threshold is
-    # flaky across random country draws (verified: 8/2000 seeds failed a
-    # >2000 assertion; 0/20000 failed at >1500). 1500 has real margin below
-    # that theoretical floor while staying well above the ~900 km/h
-    # legitimate-travel ceiling used for normal_txn transitions.
-    assert speed_kmh > 1500, f"geo_impossible pair only implies {speed_kmh:.0f} km/h over {dt_hours:.2f}h"
+    # The gap is now derived from a target speed drawn from
+    # GEO_IMPOSSIBLE_SPEED_KMH = (2000, 20000), so the implied speed should
+    # land in that band exactly (modulo float rounding) regardless of which
+    # two countries got picked - a tolerance band, not an empirically-tuned
+    # floor like the previous fixed-gap design needed.
+    assert 1500 <= speed_kmh <= 25000, f"geo_impossible pair implies {speed_kmh:.0f} km/h over {dt_hours:.2f}h"
+
+
+def test_geo_impossible_merchants_match_intended_countries(cards, merchants):
+    # Consequence of fixing merchant lat/lon to be fixed-at-creation: if
+    # fraud_geo_impossible picked a merchant without regard to country, its
+    # (now-authoritative) coordinates would silently not match the intended
+    # distant countries, invalidating the haversine distance the pattern
+    # depends on.
+    card = cards[0]
+    t1, t2 = p.fraud_geo_impossible(card, merchants)
+    for t in (t1, t2):
+        expected_lat, expected_lon, _ = p.COUNTRIES[t["country"]]
+        assert abs(t["lat"] - expected_lat) < 1.0
+        assert abs(t["lon"] - expected_lon) < 1.0
+
+
+def test_merchant_coordinates_fixed_across_transactions(cards, merchants):
+    merchant = merchants[0]
+    card = cards[0]
+    t1 = p.base_txn(card, merchant, amount=10.0)
+    t2 = p.base_txn(card, merchant, amount=20.0)
+    assert t1["lat"] == t2["lat"] == merchant["lat"]
+    assert t1["lon"] == t2["lon"] == merchant["lon"]
+
+
+def test_interarrival_median_is_hours_scale():
+    txns_per_day = 4
+    samples_hours = sorted(p._sample_interarrival_seconds(txns_per_day) / 3600 for _ in range(5000))
+    median = samples_hours[len(samples_hours) // 2]
+    expected_median = math.log(2) * 24 / txns_per_day  # exponential dist. median = ln(2)/rate ~= 4.16h
+    assert expected_median * 0.7 < median < expected_median * 1.3, (
+        f"median inter-arrival {median:.2f}h far from expected {expected_median:.2f}h"
+    )
 
 
 def test_declined_auth_never_settles(cards, merchants):
@@ -229,7 +311,7 @@ def test_declined_auth_never_settles(cards, merchants):
     for _ in range(n):
         card = random.choice(cards)
         auth = p.generate_auth_batch(card, merchants, fraud_rate=0.0)[0]
-        settlement, delay = p.decide_settlement(auth, (2, 10))
+        settlement, delay = p.decide_settlement(auth, (2, 48))
         if auth["auth_code"] != "00":
             declined_ids.add(auth["transaction_id"])
             assert settlement is None
@@ -241,7 +323,7 @@ def test_declined_auth_never_settles(cards, merchants):
 
 
 def test_parquet_schema_matches_kafka_json_schema(cards, merchants, tmp_path):
-    events = p.generate_events(50, cards, merchants, fraud_rate=0.015, delay_range=(2, 10))
+    events = p.generate_events(50, cards, merchants, fraud_rate=0.015, txns_per_day_per_card=4)
     assert len(events) == 50
 
     json_keys = set(json.loads(json.dumps(events[0])).keys())

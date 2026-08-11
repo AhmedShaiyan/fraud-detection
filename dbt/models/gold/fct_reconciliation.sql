@@ -90,7 +90,7 @@ enriched as (
         (settlement_transaction_id is not null) as has_settlement,
         (
             auth_time is not null
-            and auth_time <= current_timestamp() - interval {{ var('recon_maturity_minutes', 30) }} minutes
+            and auth_time <= current_timestamp() - interval {{ var('recon_maturity_minutes') }} minutes
         ) as is_matured
     from joined
 

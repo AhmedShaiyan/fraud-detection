@@ -30,10 +30,11 @@ vars:
   recon_amount_ceiling_abs: 100.00
 
   # Minutes an approved, unsettled auth stays PENDING_SETTLEMENT before it's
-  # reclassified as a break (AUTH_NO_SETTLEMENT). Real card networks hold an
-  # authorization for up to ~7 days before it expires unsettled; compressed
-  # to minutes to match the producer's compressed settlement-delay clock.
-  recon_maturity_minutes: 30
+  # reclassified as a break (AUTH_NO_SETTLEMENT). 10080 minutes = 7 days,
+  # the literal real-world authorization hold-expiry this was always modeled
+  # on - the producer now generates settlement delay as a real 2-48h
+  # duration, so this threshold no longer needs to be compressed to match it.
+  recon_maturity_minutes: 10080
 
 models:
   fraud_detection:

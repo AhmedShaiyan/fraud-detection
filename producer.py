@@ -4,9 +4,8 @@ Synthetic card transaction producer.
 Generates realistic card transactions and streams them to the `transactions`
 Kafka topic, keyed by card_id (per-card ordering within a partition).
 
-Event model: every transaction starts life as an AUTH, emitted immediately.
-Approved AUTHs (auth_code == "00") settle ~95% of the time after a
-configurable, compressed delay (real-world settlement is 2-48h later);
+Event model: every transaction starts life as an AUTH. Approved AUTHs
+(auth_code == "00") settle ~95% of the time after a real 2-48h delay;
 declined AUTHs never settle. A small fraction (~0.5%) of SETTLEMENTs are
 orphans that reference no real AUTH (force posts), and settled amounts may
 drift up to ~20% from the AUTH amount (tips/FX). AUTH and SETTLEMENT events
@@ -14,10 +13,24 @@ share one unified schema (fields that don't apply to a given event type are
 null), so the Kafka JSON and the --parquet-out Parquet file are the same
 shape.
 
+Unified synthetic clock: every duration in the simulation (per-card
+transaction cadence, settlement delay, flight-travel gating) runs at real
+scale - a card transacts ~4x/day on average, settlement takes a real 2-48h,
+a flight takes a real haversine-distance-based number of hours. A single
+min-heap (see _event_stream) always knows exactly what happens next, across
+every card, in chronological synthetic order. The only place "compression"
+exists at all is Kafka mode's real-time pacing: --time-compression says how
+many synthetic seconds equal one real wall-clock second when sleeping
+between emits. --parquet-out mode never sleeps, so it just runs the same
+synthetic timeline as fast as it can, anchored so it ends near generation
+wall time.
+
 Fraud patterns injected (each transaction carries a `fraud_type` label so you
 can measure model precision/recall later):
   1. velocity        - burst of 5-10 rapid transactions on one card
-  2. geo_impossible  - two transactions minutes apart in distant countries
+  2. geo_impossible  - two transactions minutes apart in distant countries,
+                        with the gap derived from a target implied speed so
+                        the pattern is impossible by construction
   3. amount_anomaly  - transaction 10-50x the card's typical spend
 
 ~1.5% of the stream is fraudulent, roughly matching real-world card fraud
@@ -25,14 +38,15 @@ base rates (real rates are lower still, ~0.1%, which is worth mentioning in
 interviews when discussing class imbalance).
 
 Usage:
-    python producer.py --rate 10                                  # ~10 txns/sec, runs forever
-    python producer.py --rate 50 --count 10000
-    python producer.py --rate 20 --count 1000 --settlement-delay-mins 2 10
-    python producer.py --parquet-out ./out --count 500            # Week 1 bridge test file
+    python producer.py                                             # ~4 txns/day/card, runs forever
+    python producer.py --time-compression 60 --count 10000
+    python producer.py --txns-per-day-per-card 8 --count 1000
+    python producer.py --parquet-out ./out --count 500              # Week 1 bridge test file
 """
 
 import argparse
 import heapq
+import itertools
 import json
 import math
 import random
@@ -56,14 +70,16 @@ BOOTSTRAP = "localhost:9092"
 NEVER_SETTLE_RATE = 0.05       # of approved auths, fraction that never settle
 ORPHAN_SETTLEMENT_RATE = 0.005 # independent chance per auth of an orphan settlement
 AMOUNT_DRIFT = 0.20            # max settlement amount drift, either direction
+SETTLEMENT_DELAY_HOURS = (2, 48)  # real auth->settlement delay range
 
 HOME_COUNTRY_RATE = 0.97       # normal txns that stay in the card's home country
 TRAVEL_TRIP_LENGTH = (3, 8)    # consecutive normal txns spent in one foreign country per trip
 VELOCITY_BURST_GAP_SECONDS = (5, 30)  # spacing between consecutive events in a velocity burst
-GEO_IMPOSSIBLE_GAP_MINUTES = (2, 10)  # spacing between the two events in a geo_impossible pair
+GEO_IMPOSSIBLE_SPEED_KMH = (2000, 20000)  # target implied speed a geo_impossible pair is built to hit
 
 FLIGHT_SPEED_KMH = 800         # commercial-flight cruise speed, for travel-delay gating
 TRAVEL_DELAY_JITTER = (1.0, 1.5)  # multiplier on pure flight time (boarding/customs/ground time)
+GROUND_SPEED_KMH = 80          # ground travel speed ceiling for same-country card-present merchant hops
 
 # --- Reference data -----------------------------------------------------------
 
@@ -141,6 +157,11 @@ def build_card_pool(n_cards: int = 500) -> list[dict]:
     current_country/travel_remaining/pending_country/next_available_at are
     mutable trip state (see _normal_txn_country): a fresh card is home-bound
     (current_country == home_country) with no pending flight.
+
+    last_present_merchant/last_present_at track the card's most recent
+    card-present (physical) transaction, for ground-speed-limited merchant
+    selection (see _pick_reachable_merchant): a fresh card has no such
+    history yet.
     """
     cards = []
     for _ in range(n_cards):
@@ -154,19 +175,27 @@ def build_card_pool(n_cards: int = 500) -> list[dict]:
             "travel_remaining": 0,
             "pending_country": None,
             "next_available_at": None,
+            "last_present_merchant": None,
+            "last_present_at": None,
         })
     return cards
 
 
 def build_merchant_pool(n_merchants: int = 300) -> list[dict]:
+    """Each merchant gets fixed lat/lon at creation (country reference point
+    plus one-time jitter) - a merchant is a physical place, so every
+    transaction at it should carry exactly the same coordinates."""
     merchants = []
     for _ in range(n_merchants):
         country = random.choices(list(COUNTRIES), weights=[w for _, _, w in COUNTRIES.values()])[0]
+        lat, lon, _ = COUNTRIES[country]
         merchants.append({
             "merchant_id": f"m_{uuid.uuid4().hex[:10]}",
             "merchant_name": fake.company(),
             "mcc": random.choice(list(MCC)),
             "country": country,
+            "lat": round(lat + random.uniform(-0.3, 0.3), 4),
+            "lon": round(lon + random.uniform(-0.3, 0.3), 4),
         })
     return merchants
 
@@ -191,7 +220,6 @@ def derive_auth_code() -> str:
 def base_txn(card: dict, merchant: dict, amount: float, ts: datetime | None = None,
              channel: str | None = None, country: str | None = None) -> dict:
     country = country or merchant["country"]
-    lat, lon, _ = COUNTRIES[country]
     channel = channel or random.choices(CHANNELS, weights=[45, 30, 10, 15])[0]
     pos_entry_mode, card_present = derive_entry_fields(channel)
     return {
@@ -207,8 +235,8 @@ def base_txn(card: dict, merchant: dict, amount: float, ts: datetime | None = No
         "amount": round(amount, 2),
         "currency": CURRENCY_BY_COUNTRY[country],
         "country": country,
-        "lat": round(lat + random.uniform(-0.3, 0.3), 4),
-        "lon": round(lon + random.uniform(-0.3, 0.3), 4),
+        "lat": merchant["lat"],
+        "lon": merchant["lon"],
         "channel": channel,
         "pos_entry_mode": pos_entry_mode,
         "card_present": card_present,
@@ -230,13 +258,14 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _flight_delay_hours(from_country: str, to_country: str) -> float:
     """Plausible travel time between two countries' reference points, at
-    FLIGHT_SPEED_KMH plus TRAVEL_DELAY_JITTER for boarding/customs/ground time."""
+    FLIGHT_SPEED_KMH plus TRAVEL_DELAY_JITTER for boarding/customs/ground time.
+    Always real hours - no compression concept lives at this layer."""
     lat1, lon1, _ = COUNTRIES[from_country]
     lat2, lon2, _ = COUNTRIES[to_country]
     return haversine_km(lat1, lon1, lat2, lon2) / FLIGHT_SPEED_KMH * random.uniform(*TRAVEL_DELAY_JITTER)
 
 
-def _normal_txn_country(card: dict, event_time: datetime, compression: float = 1.0) -> str:
+def _normal_txn_country(card: dict, event_time: datetime) -> str:
     """Country for this card's next normal transaction. HOME_COUNTRY_RATE of
     the time it stays home; otherwise the card enters "travel mode" for a
     TRAVEL_TRIP_LENGTH run of consecutive normal transactions in one foreign
@@ -245,11 +274,11 @@ def _normal_txn_country(card: dict, event_time: datetime, compression: float = 1
     Cards go quiet while they "fly": a country change (trip start or trip
     return) doesn't take effect on the transaction that decides it - that
     transaction stays in the card's current country, and next_available_at
-    is pushed out by a haversine-distance-based flight delay (divided by
-    `compression` for demo-scale Kafka runs). _pick_available_card skips the
-    card until that time, so the next time this card is actually drawn, the
-    pending country becomes current - meaning the transition row itself is
-    correctly separated from the last pre-flight row by a physically
+    is pushed out by a haversine-distance-based real flight delay. The
+    per-card scheduler (_event_stream) never schedules this card's next turn
+    before next_available_at, so the next time this card actually transacts,
+    the pending country becomes current - meaning the transition row itself
+    is correctly separated from the last pre-flight row by a physically
     plausible elapsed time, not just whatever the next draw happened to be.
     """
     if card["pending_country"] is not None:
@@ -269,31 +298,57 @@ def _normal_txn_country(card: dict, event_time: datetime, compression: float = 1
         trip_length = random.randint(*TRAVEL_TRIP_LENGTH) - 1  # this txn's arrival is trip txn #1
 
     if target != card["current_country"]:
-        delay_hours = _flight_delay_hours(card["current_country"], target) / compression
+        delay_hours = _flight_delay_hours(card["current_country"], target)
         card["next_available_at"] = event_time + timedelta(hours=delay_hours)
         card["pending_country"] = target
     card["travel_remaining"] = trip_length
     return card["current_country"]
 
 
-def _pick_available_card(cards: list[dict], now: datetime) -> dict | None:
-    """Random card that isn't mid-flight (see _normal_txn_country). Returns
-    None if every card happens to be traveling at once - the caller must
-    skip this tick (or fast-forward its clock) rather than pick a
-    still-gated card anyway, which would silently defeat the flight gate."""
-    available = [c for c in cards if c["next_available_at"] is None or c["next_available_at"] <= now]
-    return random.choice(available) if available else None
+def _pick_reachable_merchant(card: dict, eligible: list[dict], target_country: str,
+                              event_time: datetime) -> dict:
+    """Card-present merchant selection respects ground travel: pick among
+    merchants reachable at GROUND_SPEED_KMH given elapsed time since the
+    card's last card-present event, falling back to that same merchant if
+    nothing in range (never teleport a physically-present card across a
+    country in zero time just because the merchant pool is large).
+
+    No constraint (free pick) when there's no prior card-present event, or
+    when the last one was in a different country - a country change is
+    already physics-gated separately by flight delay (_normal_txn_country),
+    on a wholly different, much larger timescale than ground travel between
+    merchants within one country.
+    """
+    last_merchant = card["last_present_merchant"]
+    last_at = card["last_present_at"]
+    if last_merchant is None or last_merchant["country"] != target_country:
+        return random.choice(eligible)
+
+    elapsed_hours = max((event_time - last_at).total_seconds() / 3600, 0)
+    max_reachable_km = elapsed_hours * GROUND_SPEED_KMH
+    reachable = [m for m in eligible
+                 if haversine_km(last_merchant["lat"], last_merchant["lon"], m["lat"], m["lon"])
+                 <= max_reachable_km]
+    return random.choice(reachable) if reachable else last_merchant
 
 
-def normal_txn(card: dict, merchants: list[dict], ts: datetime | None = None,
-               compression: float = 1.0) -> list[dict]:
+def normal_txn(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
     event_time = ts or datetime.now(timezone.utc)
-    country = _normal_txn_country(card, event_time, compression)
+    country = _normal_txn_country(card, event_time)
+    channel = random.choices(CHANNELS, weights=[45, 30, 10, 15])[0]
+    is_present = channel != "ONLINE"  # matches derive_entry_fields' own ONLINE -> card_present=False rule
     eligible = [m for m in merchants if m["country"] == country] or merchants
-    merchant = random.choice(eligible)
+
+    if is_present:
+        merchant = _pick_reachable_merchant(card, eligible, country, event_time)
+        card["last_present_merchant"] = merchant
+        card["last_present_at"] = event_time
+    else:
+        merchant = random.choice(eligible)  # CNP: no location to be reachable from
+
     # spend near the card's baseline, log-normal noise
     amount = max(1.0, random.lognormvariate(0, 0.6) * card["avg_spend"])
-    return [base_txn(card, merchant, amount, event_time, country=country)]
+    return [base_txn(card, merchant, amount, event_time, channel=channel, country=country)]
 
 
 def fraud_velocity(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
@@ -316,20 +371,29 @@ def fraud_velocity(card: dict, merchants: list[dict], ts: datetime | None = None
 
 
 def fraud_geo_impossible(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
-    """Two transactions GEO_IMPOSSIBLE_GAP_MINUTES apart in countries too far
-    to travel between in that time (unlike normal_txn's travel gating, this
-    pair does NOT go through _pick_available_card/next_available_at - the
-    whole point is that these two rows are impossible, not that the card was
-    smoothly unavailable in between)."""
-    current_ts = ts or datetime.now(timezone.utc)
+    """Two transactions in distant countries, with the gap derived from a
+    target implied speed (GEO_IMPOSSIBLE_SPEED_KMH) rather than a fixed time
+    window - gap_hours = haversine_km(c1, c2) / target_speed_kmh guarantees
+    the pattern is impossible BY CONSTRUCTION regardless of which two
+    countries get picked, unlike a fixed gap (which could coincidentally
+    look plausible for nearby countries). Bypasses flight gating entirely
+    (no _normal_txn_country involvement) - that's what makes it impossible
+    instead of a legitimate (gated) trip. Merchants are filtered by country
+    so the merchant-fixed lat/lon actually reflects the intended distant
+    countries, not a random merchant's location."""
+    base_ts = ts or datetime.now(timezone.utc)
     c1, c2 = random.sample(list(COUNTRIES), 2)
+    dist_km = haversine_km(*COUNTRIES[c1][:2], *COUNTRIES[c2][:2])
+    target_speed_kmh = random.uniform(*GEO_IMPOSSIBLE_SPEED_KMH)
+    gap_hours = dist_km / target_speed_kmh
+
     txns = []
     for i, country in enumerate((c1, c2)):
-        if i > 0:
-            current_ts += timedelta(minutes=random.uniform(*GEO_IMPOSSIBLE_GAP_MINUTES))
-        merchant = random.choice(merchants)
+        event_time = base_ts if i == 0 else base_ts + timedelta(hours=gap_hours)
+        eligible = [m for m in merchants if m["country"] == country] or merchants
+        merchant = random.choice(eligible)
         amount = random.uniform(0.5, 4) * card["avg_spend"]
-        t = base_txn(card, merchant, amount, current_ts, channel="POS", country=country)
+        t = base_txn(card, merchant, amount, event_time, channel="POS", country=country)
         t["is_fraud"], t["fraud_type"] = 1, "geo_impossible"
         txns.append(t)
     return txns
@@ -349,33 +413,34 @@ FRAUD_GENERATORS = [fraud_velocity, fraud_geo_impossible, fraud_amount_anomaly]
 
 
 def generate_auth_batch(card: dict, merchants: list[dict], fraud_rate: float,
-                         ts: datetime | None = None, compression: float = 1.0) -> list[dict]:
-    """One card's worth of AUTH events for this tick: fraud with probability
+                         ts: datetime | None = None) -> list[dict]:
+    """One card's worth of AUTH events for this turn: fraud with probability
     fraud_rate (via one of the three generators), else a normal transaction."""
     if random.random() < fraud_rate:
         return random.choice(FRAUD_GENERATORS)(card, merchants, ts)
-    return normal_txn(card, merchants, ts, compression)
+    return normal_txn(card, merchants, ts)
 
 
 # --- Settlement generation ------------------------------------------------------
 
-def decide_settlement(auth: dict, delay_range: tuple[float, float]) -> tuple[dict | None, float]:
+def decide_settlement(auth: dict, delay_hours_range: tuple[float, float] = SETTLEMENT_DELAY_HOURS
+                       ) -> tuple[dict | None, float]:
     """Decide if/when/how an AUTH settles.
 
     Declined auths (auth_code != "00") never settle. Approved auths settle
     ~95% of the time (NEVER_SETTLE_RATE), after a delay drawn uniformly from
-    delay_range minutes, with the amount drifted up to AMOUNT_DRIFT (tips/FX).
-    Returns (settlement_dict_or_None, delay_minutes) - delay_minutes is 0 when
-    there is no settlement.
+    delay_hours_range real hours, with the amount drifted up to AMOUNT_DRIFT
+    (tips/FX). Returns (settlement_dict_or_None, delay_hours) - delay_hours
+    is 0 when there is no settlement.
     """
     if auth["auth_code"] != "00":
         return None, 0
     if random.random() < NEVER_SETTLE_RATE:
         return None, 0
 
-    delay_minutes = random.uniform(*delay_range)
+    delay_hours = random.uniform(*delay_hours_range)
     auth_time = datetime.fromisoformat(auth["event_time"])
-    settle_time = auth_time + timedelta(minutes=delay_minutes)
+    settle_time = auth_time + timedelta(hours=delay_hours)
     drift = random.uniform(-AMOUNT_DRIFT, AMOUNT_DRIFT)
     amount = round(auth["amount"] * (1 + drift), 2)
 
@@ -396,7 +461,7 @@ def decide_settlement(auth: dict, delay_range: tuple[float, float]) -> tuple[dic
         "is_fraud": auth["is_fraud"],
         "fraud_type": auth["fraud_type"],
     })
-    return settlement, delay_minutes
+    return settlement, delay_hours
 
 
 def orphan_settlement(cards: list[dict], merchants: list[dict], ts: datetime | None = None) -> dict:
@@ -425,6 +490,73 @@ def orphan_settlement(cards: list[dict], merchants: list[dict], ts: datetime | N
     return settlement
 
 
+# --- Unified event-driven scheduling --------------------------------------------
+
+def _sample_interarrival_seconds(txns_per_day_per_card: float) -> float:
+    """Exponential inter-arrival time for a Poisson arrival process at the
+    given per-card daily rate."""
+    rate_per_second = txns_per_day_per_card / 86400
+    return random.expovariate(rate_per_second)
+
+
+def _event_stream(cards: list[dict], merchants: list[dict], fraud_rate: float,
+                   txns_per_day_per_card: float, settlement_delay_hours: tuple[float, float],
+                   start_time: datetime, heap: list[tuple[datetime, int, str, dict]] | None = None):
+    """Core simulation loop, shared by Kafka and Parquet modes. Yields
+    (event, synthetic_time, kind) forever, in strict chronological synthetic
+    order - kind is "auth" | "settlement" | "orphan".
+
+    A single min-heap drives everything: each card has its own Poisson
+    arrival process (exponential inter-arrival at txns_per_day_per_card);
+    settlements and orphan force-posts are scheduled onto the SAME heap
+    using each event's own timestamp, so the whole stream - auths,
+    settlements, orphans, across every card - comes out in one strictly
+    ordered synthetic timeline. A card's next turn is never scheduled before
+    its flight gate (next_available_at, see _normal_txn_country) clears, so
+    there's no separate "is this card available" filter needed at pop time.
+
+    Pass a `heap` list in if the caller wants to inspect what's still
+    pending after the generator is abandoned mid-stream (e.g. Ctrl+C) - the
+    generator only ever pops/pushes onto it, never drains it on its own.
+    """
+    if heap is None:
+        heap = []
+    seq = itertools.count()  # tie-breaker so heapq never compares dicts
+
+    for card in cards:
+        due = start_time + timedelta(seconds=_sample_interarrival_seconds(txns_per_day_per_card))
+        heapq.heappush(heap, (due, next(seq), "txn", card))
+
+    while True:
+        due_at, _, kind, payload = heapq.heappop(heap)
+
+        if kind != "txn":
+            yield payload, due_at, kind
+            continue
+
+        card = payload
+        last_event_time = due_at
+        for a in generate_auth_batch(card, merchants, fraud_rate, ts=due_at):
+            a_time = datetime.fromisoformat(a["event_time"])
+            last_event_time = max(last_event_time, a_time)
+            yield a, a_time, "auth"
+
+            settlement, delay_hours = decide_settlement(a, settlement_delay_hours)
+            if settlement is not None:
+                settle_at = a_time + timedelta(hours=delay_hours)
+                heapq.heappush(heap, (settle_at, next(seq), "settlement", settlement))
+
+            if random.random() < ORPHAN_SETTLEMENT_RATE:
+                orphan = orphan_settlement(cards, merchants, ts=a_time)
+                orphan_at = a_time + timedelta(minutes=random.uniform(0, 5))
+                heapq.heappush(heap, (orphan_at, next(seq), "orphan", orphan))
+
+        next_due = last_event_time + timedelta(seconds=_sample_interarrival_seconds(txns_per_day_per_card))
+        if card["next_available_at"] is not None and card["next_available_at"] > next_due:
+            next_due = card["next_available_at"]
+        heapq.heappush(heap, (next_due, next(seq), "txn", card))
+
+
 # --- Kafka plumbing -----------------------------------------------------------
 
 def delivery_report(err, msg):
@@ -451,96 +583,79 @@ def run_kafka(args: argparse.Namespace) -> None:
 
     cards = build_card_pool()
     merchants = build_merchant_pool()
-    pending: list[tuple[float, dict]] = []  # heap of (due_at wall-clock, settlement event)
-    sent = fraud_sent = settled_sent = orphan_sent = 0
+    start_time = datetime.now(timezone.utc)  # live stream: clock starts now, moves forward
+    heap: list[tuple[datetime, int, str, dict]] = []  # kept so Ctrl+C can inspect what's still pending
+    stream = _event_stream(cards, merchants, args.fraud_rate, args.txns_per_day_per_card,
+                            SETTLEMENT_DELAY_HOURS, start_time, heap=heap)
 
-    print(f"Producing to '{TOPIC}' at ~{args.rate}/sec. Ctrl+C to stop.")
+    sent = auth_sent = fraud_sent = settled_sent = orphan_sent = 0
+    prev_synthetic = start_time
+    interrupted = False
+
+    print(f"Producing to '{TOPIC}': {args.txns_per_day_per_card} txns/day/card x {len(cards)} cards, "
+          f"{args.time_compression}x time compression. Ctrl+C to stop.")
     try:
-        while args.count == 0 or sent < args.count:
-            now = time.time()
-            while pending and pending[0][0] <= now:
-                _, settlement = heapq.heappop(pending)
-                emit(producer, settlement)
-                sent += 1
+        for event, due_at, kind in stream:
+            if args.count and sent >= args.count:
+                break
+
+            real_wait = (due_at - prev_synthetic).total_seconds() / args.time_compression
+            if real_wait > 0:
+                time.sleep(real_wait)
+
+            emit(producer, event)
+            sent += 1
+            prev_synthetic = due_at
+            if kind == "auth":
+                auth_sent += 1
+                fraud_sent += event["is_fraud"]
+            elif kind == "settlement":
                 settled_sent += 1
-
-            card = _pick_available_card(cards, datetime.now(timezone.utc))
-            if card is None:
-                # every card is mid-flight; let real wall-clock time pass
-                # rather than pick a still-gated card and fake its arrival
-                producer.poll(0)
-                time.sleep(0.05)
-                continue
-            auths = generate_auth_batch(card, merchants, args.fraud_rate,
-                                         compression=args.travel_delay_compression)
-
-            for a in auths:
-                emit(producer, a)
-                sent += 1
-                fraud_sent += a["is_fraud"]
-
-                settlement, delay_minutes = decide_settlement(a, args.settlement_delay_mins)
-                if settlement is not None:
-                    heapq.heappush(pending, (time.time() + delay_minutes * 60, settlement))
-
-                if random.random() < ORPHAN_SETTLEMENT_RATE:
-                    orphan = orphan_settlement(cards, merchants)
-                    heapq.heappush(pending, (time.time() + random.uniform(0, 5), orphan))
-                    orphan_sent += 1
+            elif kind == "orphan":
+                orphan_sent += 1
 
             producer.poll(0)
-            if sent % 100 < len(auths):
+            if sent % 100 == 0:
                 print(f"sent={sent}  fraud={fraud_sent}  settled={settled_sent}  "
-                      f"orphans={orphan_sent}  pending={len(pending)}  "
+                      f"orphans={orphan_sent}  synthetic_time={due_at.isoformat()}  "
                       f"fraud_rate={fraud_sent / max(sent, 1):.2%}")
-            time.sleep(len(auths) / args.rate)
     except KeyboardInterrupt:
-        pass
+        interrupted = True
     finally:
-        if pending:
-            print(f"Fast-forwarding {len(pending)} pending settlements...")
-            while pending:
-                _, settlement = heapq.heappop(pending)
-                emit(producer, settlement)
-                sent += 1
-                settled_sent += 1
-            producer.poll(0)
         producer.flush()
         print(f"\nDone. sent={sent}, fraud={fraud_sent}, settled={settled_sent}, orphans={orphan_sent}")
+        if interrupted:
+            # No drain on interrupt - a real system stopping doesn't
+            # retroactively settle everything either. This just reports
+            # what was left in flight, on the heap, untouched.
+            pending = sum(1 for entry in heap if entry[2] != "txn")
+            gated_cards = sum(1 for c in cards
+                               if c["next_available_at"] is not None and c["next_available_at"] > prev_synthetic)
+            print(f"Interrupted: {auth_sent} auths emitted, {pending} settlements/orphans still "
+                  f"pending on the heap, {gated_cards} cards currently flight-gated.")
 
 
 # --- Parquet bridge-test mode ---------------------------------------------------
 
-def generate_events(n: int, cards: list[dict], merchants: list[dict],
-                     fraud_rate: float, delay_range: tuple[float, float]) -> list[dict]:
-    """Generate n events (AUTH + their resolved SETTLEMENT/orphans) with a
-    synthetic advancing clock instead of real-time waiting, for the Parquet
-    bridge-test file."""
+def generate_events(n: int, cards: list[dict], merchants: list[dict], fraud_rate: float,
+                     txns_per_day_per_card: float,
+                     settlement_delay_hours: tuple[float, float] = SETTLEMENT_DELAY_HOURS) -> list[dict]:
+    """Generate n events via the unified synthetic-clock event stream. The
+    start time is anchored so the run's span (estimated from the aggregate
+    per-card arrival rate) ends near generation wall time - this is a
+    stochastic Poisson process, so the last event lands approximately, not
+    exactly, at "now"."""
+    aggregate_rate_per_second = len(cards) * txns_per_day_per_card / 86400
+    expected_span_seconds = n / aggregate_rate_per_second
+    start_time = datetime.now(timezone.utc) - timedelta(seconds=expected_span_seconds)
+
+    stream = _event_stream(cards, merchants, fraud_rate, txns_per_day_per_card,
+                            settlement_delay_hours, start_time)
     events: list[dict] = []
-    clock = datetime.now(timezone.utc)
-
-    while len(events) < n:
-        card = _pick_available_card(cards, clock)
-        if card is None:
-            # every card is mid-flight; fast-forward the synthetic clock to
-            # the soonest one that lands rather than manufacture a
-            # transaction that would violate its own flight gate.
-            clock = min(c["next_available_at"] for c in cards)
-            continue
-        # compression=1.0 (default): travel delays are enforced against this
-        # synthetic clock directly, at real flight-time scale - no wall-clock
-        # demo constraint to compress for, unlike Kafka mode.
-        auths = generate_auth_batch(card, merchants, fraud_rate, ts=clock)
-
-        for a in auths:
-            events.append(a)
-            settlement, _ = decide_settlement(a, delay_range)
-            if settlement is not None:
-                events.append(settlement)
-            if random.random() < ORPHAN_SETTLEMENT_RATE:
-                events.append(orphan_settlement(cards, merchants, ts=clock))
-
-        clock += timedelta(seconds=random.uniform(0.1, 2.0) * len(auths))
+    for event, _, _ in stream:
+        events.append(event)
+        if len(events) >= n:
+            break
 
     events.sort(key=lambda e: e["event_time"])
     return events[:n]
@@ -557,7 +672,7 @@ def write_parquet(events: list[dict], out_dir: Path) -> Path:
 def run_parquet(args: argparse.Namespace) -> None:
     cards = build_card_pool()
     merchants = build_merchant_pool()
-    events = generate_events(args.count, cards, merchants, args.fraud_rate, args.settlement_delay_mins)
+    events = generate_events(args.count, cards, merchants, args.fraud_rate, args.txns_per_day_per_card)
     path = write_parquet(events, Path(args.parquet_out))
 
     fraud = sum(e["is_fraud"] for e in events)
@@ -567,16 +682,14 @@ def run_parquet(args: argparse.Namespace) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rate", type=float, default=10, help="approx transactions per second")
     parser.add_argument("--count", type=int, default=0, help="stop after N transactions (0 = forever; required > 0 for --parquet-out)")
     parser.add_argument("--fraud-rate", type=float, default=0.015)
-    parser.add_argument("--settlement-delay-mins", type=float, nargs=2, default=[2, 10],
-                         metavar=("MIN", "MAX"), help="compressed settlement delay range in minutes")
-    parser.add_argument("--travel-delay-compression", type=float, default=200,
-                         help="Kafka mode only: divides real flight time (haversine distance / "
-                              "%d km/h) down to demo wall-clock scale, e.g. default 200 means a "
-                              "17h flight takes ~5min wall time. --parquet-out mode always uses "
-                              "the uncompressed real flight time against its synthetic clock." % FLIGHT_SPEED_KMH)
+    parser.add_argument("--txns-per-day-per-card", type=float, default=4,
+                         help="mean transactions per card per day, drawn as an exponential inter-arrival process")
+    parser.add_argument("--time-compression", type=float, default=600,
+                         help="Kafka mode only: synthetic seconds per real wall-clock second; "
+                              "default 600 means 1 wall second = 10 synthetic minutes. "
+                              "--parquet-out mode never sleeps, so this doesn't apply to it.")
     parser.add_argument("--parquet-out", type=str, default=None,
                          help="write --count events to one Parquet file in this dir instead of producing to Kafka")
     args = parser.parse_args()
