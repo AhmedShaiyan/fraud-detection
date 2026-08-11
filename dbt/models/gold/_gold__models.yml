@@ -7,15 +7,18 @@ models:
       header comment for why incremental is invalid here). Grain: one row
       per AUTH transaction plus one row per orphan SETTLEMENT.
     columns:
-      - name: auth_transaction_id
+      - name: recon_key
         description: >
-          transaction_id of the AUTH when one exists, else the (unmatched)
-          auth_transaction_id carried by an orphan SETTLEMENT. Always
-          populated by construction of the full outer join, and unique per
-          row - this is the model's coalesce/grain key.
+          coalesce(auth_transaction_id, settlement_transaction_id). The
+          model's grain key - always populated (every row has an auth or a
+          settlement, by construction of the full outer join) and unique per
+          row. 
         data_tests:
           - not_null
           - unique
+      - name: auth_transaction_id
+        description: >
+          transaction_id of the AUTH. Null for ORPHAN_SETTLEMENT rows .
       - name: recon_status
         data_tests:
           - not_null
@@ -28,3 +31,21 @@ models:
                   - PENDING_SETTLEMENT
                   - AUTH_DECLINED
                   - ORPHAN_SETTLEMENT
+
+  - name: fct_card_velocity_features
+    description: >
+      Point-in-time rolling-window features per AUTH transaction (including
+      declined auths - decline storms are a card-testing signal). One row
+      per slv_authorizations row. is_fraud/fraud_type are passthrough labels
+      only, not model inputs (see leakage comment in the model).
+    columns:
+      - name: transaction_id
+        data_tests:
+          - unique
+          - not_null
+      - name: card_id_hash
+        data_tests:
+          - not_null
+      - name: event_time
+        data_tests:
+          - not_null

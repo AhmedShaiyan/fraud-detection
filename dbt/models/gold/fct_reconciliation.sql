@@ -127,6 +127,7 @@ statused as (
 
 select
 
+    recon_key,
     auth_transaction_id,
     settlement_transaction_id,
     card_id_hash,
