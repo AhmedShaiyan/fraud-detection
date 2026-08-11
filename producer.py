@@ -34,6 +34,7 @@ Usage:
 import argparse
 import heapq
 import json
+import math
 import random
 import time
 import uuid
@@ -55,6 +56,14 @@ BOOTSTRAP = "localhost:9092"
 NEVER_SETTLE_RATE = 0.05       # of approved auths, fraction that never settle
 ORPHAN_SETTLEMENT_RATE = 0.005 # independent chance per auth of an orphan settlement
 AMOUNT_DRIFT = 0.20            # max settlement amount drift, either direction
+
+HOME_COUNTRY_RATE = 0.97       # normal txns that stay in the card's home country
+TRAVEL_TRIP_LENGTH = (3, 8)    # consecutive normal txns spent in one foreign country per trip
+VELOCITY_BURST_GAP_SECONDS = (5, 30)  # spacing between consecutive events in a velocity burst
+GEO_IMPOSSIBLE_GAP_MINUTES = (2, 10)  # spacing between the two events in a geo_impossible pair
+
+FLIGHT_SPEED_KMH = 800         # commercial-flight cruise speed, for travel-delay gating
+TRAVEL_DELAY_JITTER = (1.0, 1.5)  # multiplier on pure flight time (boarding/customs/ground time)
 
 # --- Reference data -----------------------------------------------------------
 
@@ -127,7 +136,12 @@ PARQUET_SCHEMA = pa.schema([
 
 def build_card_pool(n_cards: int = 500) -> list[dict]:
     """Each card gets a home country, a typical spend level, and preferred merchants.
-    Card-level behavioral baselines are what make anomalies detectable."""
+    Card-level behavioral baselines are what make anomalies detectable.
+
+    current_country/travel_remaining/pending_country/next_available_at are
+    mutable trip state (see _normal_txn_country): a fresh card is home-bound
+    (current_country == home_country) with no pending flight.
+    """
     cards = []
     for _ in range(n_cards):
         home = random.choices(list(COUNTRIES), weights=[w for _, _, w in COUNTRIES.values()])[0]
@@ -136,6 +150,10 @@ def build_card_pool(n_cards: int = 500) -> list[dict]:
             "home_country": home,
             "avg_spend": round(random.lognormvariate(3.5, 0.8), 2),  # median ~SGD 33
             "preferred_mccs": random.sample(list(MCC), k=4),
+            "current_country": home,
+            "travel_remaining": 0,
+            "pending_country": None,
+            "next_available_at": None,
         })
     return cards
 
@@ -200,36 +218,118 @@ def base_txn(card: dict, merchant: dict, amount: float, ts: datetime | None = No
     }
 
 
-def normal_txn(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
-    merchant = random.choice(merchants)
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km. Python mirror of dbt/macros/haversine.sql,
+    used here to gate plausible card travel time between countries."""
+    r = 6371
+    lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
+    a = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _flight_delay_hours(from_country: str, to_country: str) -> float:
+    """Plausible travel time between two countries' reference points, at
+    FLIGHT_SPEED_KMH plus TRAVEL_DELAY_JITTER for boarding/customs/ground time."""
+    lat1, lon1, _ = COUNTRIES[from_country]
+    lat2, lon2, _ = COUNTRIES[to_country]
+    return haversine_km(lat1, lon1, lat2, lon2) / FLIGHT_SPEED_KMH * random.uniform(*TRAVEL_DELAY_JITTER)
+
+
+def _normal_txn_country(card: dict, event_time: datetime, compression: float = 1.0) -> str:
+    """Country for this card's next normal transaction. HOME_COUNTRY_RATE of
+    the time it stays home; otherwise the card enters "travel mode" for a
+    TRAVEL_TRIP_LENGTH run of consecutive normal transactions in one foreign
+    country before returning home.
+
+    Cards go quiet while they "fly": a country change (trip start or trip
+    return) doesn't take effect on the transaction that decides it - that
+    transaction stays in the card's current country, and next_available_at
+    is pushed out by a haversine-distance-based flight delay (divided by
+    `compression` for demo-scale Kafka runs). _pick_available_card skips the
+    card until that time, so the next time this card is actually drawn, the
+    pending country becomes current - meaning the transition row itself is
+    correctly separated from the last pre-flight row by a physically
+    plausible elapsed time, not just whatever the next draw happened to be.
+    """
+    if card["pending_country"] is not None:
+        card["current_country"] = card["pending_country"]
+        card["pending_country"] = None
+        return card["current_country"]
+
+    if card["travel_remaining"] > 0:
+        card["travel_remaining"] -= 1
+        return card["current_country"]
+
+    if random.random() < HOME_COUNTRY_RATE:
+        target, trip_length = card["home_country"], 0
+    else:
+        foreign = [c for c in COUNTRIES if c != card["home_country"]]
+        target = random.choice(foreign)
+        trip_length = random.randint(*TRAVEL_TRIP_LENGTH) - 1  # this txn's arrival is trip txn #1
+
+    if target != card["current_country"]:
+        delay_hours = _flight_delay_hours(card["current_country"], target) / compression
+        card["next_available_at"] = event_time + timedelta(hours=delay_hours)
+        card["pending_country"] = target
+    card["travel_remaining"] = trip_length
+    return card["current_country"]
+
+
+def _pick_available_card(cards: list[dict], now: datetime) -> dict | None:
+    """Random card that isn't mid-flight (see _normal_txn_country). Returns
+    None if every card happens to be traveling at once - the caller must
+    skip this tick (or fast-forward its clock) rather than pick a
+    still-gated card anyway, which would silently defeat the flight gate."""
+    available = [c for c in cards if c["next_available_at"] is None or c["next_available_at"] <= now]
+    return random.choice(available) if available else None
+
+
+def normal_txn(card: dict, merchants: list[dict], ts: datetime | None = None,
+               compression: float = 1.0) -> list[dict]:
+    event_time = ts or datetime.now(timezone.utc)
+    country = _normal_txn_country(card, event_time, compression)
+    eligible = [m for m in merchants if m["country"] == country] or merchants
+    merchant = random.choice(eligible)
     # spend near the card's baseline, log-normal noise
     amount = max(1.0, random.lognormvariate(0, 0.6) * card["avg_spend"])
-    return [base_txn(card, merchant, amount, ts)]
+    return [base_txn(card, merchant, amount, event_time, country=country)]
 
 
 def fraud_velocity(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
-    """5-10 small-to-medium transactions on one card within ~2 minutes.
-    Classic card-testing / stolen-card cashout pattern."""
+    """5-10 small-to-medium transactions on one card and merchant, spaced
+    VELOCITY_BURST_GAP_SECONDS apart (up to ~4.5 min end-to-end for a 10-txn
+    burst) so implied_speed_kmh-style elapsed-time features see a real,
+    strictly-ascending timeline instead of a same-second pile-up. Classic
+    card-testing / stolen-card cashout pattern."""
     txns = []
-    base_ts = ts or datetime.now(timezone.utc)
+    current_ts = ts or datetime.now(timezone.utc)
     merchant = random.choice(merchants)
-    for _ in range(random.randint(5, 10)):
+    for i in range(random.randint(5, 10)):
+        if i > 0:
+            current_ts += timedelta(seconds=random.uniform(*VELOCITY_BURST_GAP_SECONDS))
         amount = random.uniform(1, 3) * card["avg_spend"]
-        t = base_txn(card, merchant, amount, base_ts, channel="ONLINE")
+        t = base_txn(card, merchant, amount, current_ts, channel="ONLINE")
         t["is_fraud"], t["fraud_type"] = 1, "velocity"
         txns.append(t)
     return txns
 
 
 def fraud_geo_impossible(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
-    """Two transactions minutes apart in countries too far to travel between."""
-    base_ts = ts or datetime.now(timezone.utc)
+    """Two transactions GEO_IMPOSSIBLE_GAP_MINUTES apart in countries too far
+    to travel between in that time (unlike normal_txn's travel gating, this
+    pair does NOT go through _pick_available_card/next_available_at - the
+    whole point is that these two rows are impossible, not that the card was
+    smoothly unavailable in between)."""
+    current_ts = ts or datetime.now(timezone.utc)
     c1, c2 = random.sample(list(COUNTRIES), 2)
     txns = []
-    for country in (c1, c2):
+    for i, country in enumerate((c1, c2)):
+        if i > 0:
+            current_ts += timedelta(minutes=random.uniform(*GEO_IMPOSSIBLE_GAP_MINUTES))
         merchant = random.choice(merchants)
         amount = random.uniform(0.5, 4) * card["avg_spend"]
-        t = base_txn(card, merchant, amount, base_ts, channel="POS", country=country)
+        t = base_txn(card, merchant, amount, current_ts, channel="POS", country=country)
         t["is_fraud"], t["fraud_type"] = 1, "geo_impossible"
         txns.append(t)
     return txns
@@ -249,12 +349,12 @@ FRAUD_GENERATORS = [fraud_velocity, fraud_geo_impossible, fraud_amount_anomaly]
 
 
 def generate_auth_batch(card: dict, merchants: list[dict], fraud_rate: float,
-                         ts: datetime | None = None) -> list[dict]:
+                         ts: datetime | None = None, compression: float = 1.0) -> list[dict]:
     """One card's worth of AUTH events for this tick: fraud with probability
     fraud_rate (via one of the three generators), else a normal transaction."""
     if random.random() < fraud_rate:
         return random.choice(FRAUD_GENERATORS)(card, merchants, ts)
-    return normal_txn(card, merchants, ts)
+    return normal_txn(card, merchants, ts, compression)
 
 
 # --- Settlement generation ------------------------------------------------------
@@ -364,8 +464,15 @@ def run_kafka(args: argparse.Namespace) -> None:
                 sent += 1
                 settled_sent += 1
 
-            card = random.choice(cards)
-            auths = generate_auth_batch(card, merchants, args.fraud_rate)
+            card = _pick_available_card(cards, datetime.now(timezone.utc))
+            if card is None:
+                # every card is mid-flight; let real wall-clock time pass
+                # rather than pick a still-gated card and fake its arrival
+                producer.poll(0)
+                time.sleep(0.05)
+                continue
+            auths = generate_auth_batch(card, merchants, args.fraud_rate,
+                                         compression=args.travel_delay_compression)
 
             for a in auths:
                 emit(producer, a)
@@ -413,7 +520,16 @@ def generate_events(n: int, cards: list[dict], merchants: list[dict],
     clock = datetime.now(timezone.utc)
 
     while len(events) < n:
-        card = random.choice(cards)
+        card = _pick_available_card(cards, clock)
+        if card is None:
+            # every card is mid-flight; fast-forward the synthetic clock to
+            # the soonest one that lands rather than manufacture a
+            # transaction that would violate its own flight gate.
+            clock = min(c["next_available_at"] for c in cards)
+            continue
+        # compression=1.0 (default): travel delays are enforced against this
+        # synthetic clock directly, at real flight-time scale - no wall-clock
+        # demo constraint to compress for, unlike Kafka mode.
         auths = generate_auth_batch(card, merchants, fraud_rate, ts=clock)
 
         for a in auths:
@@ -456,6 +572,11 @@ def main():
     parser.add_argument("--fraud-rate", type=float, default=0.015)
     parser.add_argument("--settlement-delay-mins", type=float, nargs=2, default=[2, 10],
                          metavar=("MIN", "MAX"), help="compressed settlement delay range in minutes")
+    parser.add_argument("--travel-delay-compression", type=float, default=200,
+                         help="Kafka mode only: divides real flight time (haversine distance / "
+                              "%d km/h) down to demo wall-clock scale, e.g. default 200 means a "
+                              "17h flight takes ~5min wall time. --parquet-out mode always uses "
+                              "the uncompressed real flight time against its synthetic clock." % FLIGHT_SPEED_KMH)
     parser.add_argument("--parquet-out", type=str, default=None,
                          help="write --count events to one Parquet file in this dir instead of producing to Kafka")
     args = parser.parse_args()
