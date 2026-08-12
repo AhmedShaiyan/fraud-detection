@@ -14,6 +14,23 @@
 -- forever" but an incremental model with a lookback window: only rebuild
 -- auths from the last N days, since anything older than the maturity window
 -- is final and never needs to be revisited.
+--
+-- ORPHAN_SETTLEMENT conflates two different things, and it is worth knowing
+-- which one you are looking at. The intended meaning is a force post: a
+-- settlement the network pushed through with no prior authorization. But this
+-- model reads slv_authorizations, which excludes rows held in slv_quarantine
+-- (macros/transaction_validity.sql) - so an AUTH that arrived malformed is
+-- absent from the auth side while its settlement still arrives, matches
+-- nothing, and lands in this same bucket. Those are opposite operational
+-- problems: one is payment-network behavior to reconcile, the other is a
+-- data-quality incident to fix upstream. Running the producer with
+-- --dirty-rate > 0 makes the second kind appear.
+--
+-- Future refinement (not implemented): left join the unmatched settlements to
+-- slv_quarantine on auth_transaction_id = quarantine.transaction_id and split
+-- the status into ORPHAN_SETTLEMENT vs QUARANTINED_AUTH, so the break report
+-- routes each to the right owner instead of blaming the network for a bad
+-- record.
 
 with auths as (
 

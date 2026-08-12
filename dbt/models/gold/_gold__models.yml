@@ -20,6 +20,10 @@ models:
         description: >
           transaction_id of the AUTH. Null for ORPHAN_SETTLEMENT rows .
       - name: recon_status
+        description: >
+          ORPHAN_SETTLEMENT covers both true force posts and settlements whose
+          AUTH was quarantined as malformed; see the model header for why they
+          are conflated today and how to split them.
         data_tests:
           - not_null
           - accepted_values:

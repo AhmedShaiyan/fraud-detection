@@ -1,0 +1,31 @@
+version: 2
+
+models:
+  - name: stg_merchants_current
+    description: >
+      Current merchant master, derived from the latest AUTH per merchant_id
+      (this pipeline has no merchant dimension feed - merchants are only
+      observed through transactions). Built on slv_authorizations, so
+      quarantined rows cannot rewrite a merchant's attributes. Source for
+      merchants_snapshot, whose check strategy depends on the deterministic
+      tie-break in this view's ORDER BY.
+    columns:
+      - name: merchant_id
+        description: Stable across producer runs - built from the fixed ENTITY_SEED.
+        data_tests:
+          - unique
+          - not_null
+      - name: merchant_name
+        description: Drifts over time; tracked as a check_col in merchants_snapshot.
+        data_tests:
+          - not_null
+      - name: mcc
+        description: Drifts over time; tracked as a check_col in merchants_snapshot.
+        data_tests:
+          - not_null
+      - name: last_seen_at
+        description: >
+          event_time of the AUTH these attributes were taken from.
+          Deliberately not carried into the snapshot - see the note there.
+        data_tests:
+          - not_null

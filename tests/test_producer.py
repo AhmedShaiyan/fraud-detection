@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import random
@@ -15,8 +16,12 @@ import producer as p
 
 @pytest.fixture(autouse=True)
 def _reseed():
+    # p.seed_simulation seeds the producer's simulation stream; random.seed
+    # covers the tests' own random.choice(cards) draws, which are independent
+    # of it. The entity stream is seeded from the fixed ENTITY_SEED and needs
+    # no reseeding - that is the point of it.
+    p.seed_simulation(42)
     random.seed(42)
-    p.Faker.seed(42)
 
 
 @pytest.fixture
@@ -26,7 +31,9 @@ def cards():
 
 @pytest.fixture
 def merchants():
-    return p.build_merchant_pool(n_merchants=20)
+    # drift_seed pinned so the suite is deterministic; the drift tests below
+    # exercise drift explicitly instead of relying on the default 2% roll.
+    return p.build_merchant_pool(n_merchants=20, drift_seed=0)
 
 
 def test_settlement_references_real_auth(cards, merchants):
@@ -60,6 +67,66 @@ def test_settlement_rate_approx_95_percent(cards, merchants):
             settled += 1
     rate = settled / n
     assert abs(rate - 0.95) < 0.03, f"settlement rate {rate:.3f} not close to 0.95"
+
+
+def _drift_samples(cards, merchants, n=6000):
+    """(mcc, drift_fraction) for n settled auths."""
+    samples = []
+    while len(samples) < n:
+        card = random.choice(cards)
+        auth = p.generate_auth_batch(card, merchants, fraud_rate=0.0)[0]
+        auth["auth_code"] = "00"  # isolate drift from the decline carve-out
+        settlement, _ = p.decide_settlement(auth, (2, 48))
+        if settlement is not None:
+            samples.append((auth["mcc"], settlement["amount"] / auth["amount"] - 1))
+    return samples
+
+
+def test_settlement_drift_mixture_proportions(cards, merchants):
+    samples = _drift_samples(cards, merchants)
+    exact = sum(1 for _, d in samples if d == 0)
+    tip = sum(1 for _, d in samples if d > 0 and abs(d) > p.SETTLEMENT_SMALL_DRIFT)
+    small = len(samples) - exact - tip
+
+    exact_rate, small_rate, tip_rate = (c / len(samples) for c in (exact, small, tip))
+    assert abs(exact_rate - 0.70) < 0.03, f"exact-match rate {exact_rate:.3f} not near 0.70"
+    assert abs(small_rate - 0.25) < 0.03, f"small-drift rate {small_rate:.3f} not near 0.25"
+    assert abs(tip_rate - 0.05) < 0.02, f"tip rate {tip_rate:.3f} not near 0.05"
+
+
+def test_settlement_drift_categories_stay_in_their_bands(cards, merchants):
+    for mcc, drift in _drift_samples(cards, merchants, n=3000):
+        if drift == 0:
+            continue
+        if abs(drift) <= p.SETTLEMENT_SMALL_DRIFT:
+            continue  # FX/rounding band, symmetric
+        # Anything larger must be a tip: upward, bounded, and at an MCC where
+        # tipping actually happens.
+        low, high = p.SETTLEMENT_TIP_RANGE
+        assert low <= drift <= high, f"drift {drift:.4f} outside tip range {p.SETTLEMENT_TIP_RANGE}"
+        assert mcc in p.TIPPABLE_MCCS, f"tip at non-tippable mcc {mcc}"
+
+
+def test_settlement_drift_never_negative_beyond_fx_band(cards, merchants):
+    # A tip can only increase the amount, so no settlement should ever come
+    # back more than SETTLEMENT_SMALL_DRIFT *below* the auth.
+    drifts = [d for _, d in _drift_samples(cards, merchants, n=3000)]
+    assert min(drifts) >= -p.SETTLEMENT_SMALL_DRIFT
+    assert max(drifts) > p.SETTLEMENT_SMALL_DRIFT, "expected at least one tip in 3000 settlements"
+
+
+def test_settlement_exact_match_is_bit_exact(cards, merchants):
+    # "Exact" has to survive the round(_, 2): a settlement in the exact-match
+    # branch must equal the auth amount, not merely be close to it.
+    exact_seen = 0
+    for _ in range(2000):
+        card = random.choice(cards)
+        auth = p.generate_auth_batch(card, merchants, fraud_rate=0.0)[0]
+        auth["auth_code"] = "00"
+        settlement, _ = p.decide_settlement(auth, (2, 48))
+        if settlement is not None and settlement["amount"] == auth["amount"]:
+            exact_seen += 1
+    assert exact_seen > 0
 
 
 def test_fraud_rate_approx_1_5_percent(cards, merchants):
@@ -100,7 +167,7 @@ def test_velocity_timestamps_strictly_ascending(cards, merchants):
 
 def test_normal_txn_home_bound_shares_country(cards, merchants, monkeypatch):
     card = cards[0]
-    monkeypatch.setattr(p.random, "random", lambda: 0.01)  # always below HOME_COUNTRY_RATE
+    monkeypatch.setattr(p._SIM, "random", lambda: 0.01)  # always below HOME_COUNTRY_RATE
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     countries = {p._normal_txn_country(card, now) for _ in range(20)}
     assert countries == {card["home_country"]}
@@ -114,8 +181,13 @@ def test_travel_mode_returns_home(cards, merchants, monkeypatch):
     card = cards[0]
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     responses = iter([0.98, 0.01])  # 0.98 -> decide to travel; 0.01 -> decide to return home
-    monkeypatch.setattr(p.random, "random", lambda: next(responses))
-    monkeypatch.setattr(p.random, "randint", lambda a, b: 3)  # fixed trip length = 3
+    monkeypatch.setattr(p._SIM, "random", lambda: next(responses))
+    monkeypatch.setattr(p._SIM, "randint", lambda a, b: 3)  # fixed trip length = 3
+    # Also stub uniform: on a Random *instance*, uniform() is implemented in
+    # terms of self.random(), so the flight-delay jitter draw would otherwise
+    # eat a scripted response. (Patching the random module's function had no
+    # such effect, since module-level uniform is bound to a hidden instance.)
+    monkeypatch.setattr(p._SIM, "uniform", lambda a, b: a)
 
     # call 1: decision to travel - this txn is still home, gate now set
     assert p._normal_txn_country(card, now) == card["home_country"]
@@ -214,10 +286,12 @@ def test_same_country_card_present_pairs_respect_ground_speed():
     # across several seeds, matching how the original bug was surfaced.
     checked = 0
     for seed in range(10):
-        random.seed(seed)
-        p.Faker.seed(seed)
+        # Sweeping the simulation seed only: the card/merchant pools are
+        # entity-seeded and therefore identical on every iteration, which is
+        # the point - it isolates the simulation as the thing being varied.
+        p.seed_simulation(seed)
         cards = p.build_card_pool(n_cards=30)
-        merchants = p.build_merchant_pool(n_merchants=60)
+        merchants = p.build_merchant_pool(n_merchants=60, drift_seed=seed)
         events = p.generate_events(1500, cards, merchants, fraud_rate=0.0, txns_per_day_per_card=4)
 
         auths = [e for e in events if e["event_type"] == "AUTH" and e["card_present"]]
@@ -271,12 +345,21 @@ def test_geo_impossible_still_violates_physics(cards, merchants):
     assert 1500 <= speed_kmh <= 25000, f"geo_impossible pair implies {speed_kmh:.0f} km/h over {dt_hours:.2f}h"
 
 
-def test_geo_impossible_merchants_match_intended_countries(cards, merchants):
+def test_geo_impossible_merchants_match_intended_countries(cards):
     # Consequence of fixing merchant lat/lon to be fixed-at-creation: if
     # fraud_geo_impossible picked a merchant without regard to country, its
     # (now-authoritative) coordinates would silently not match the intended
     # distant countries, invalidating the haversine distance the pattern
     # depends on.
+    #
+    # Needs a pool big enough that every country is actually represented,
+    # asserted below: with a small pool, fraud_geo_impossible's `or merchants`
+    # fallback kicks in for an unrepresented country and the coordinates
+    # legitimately don't match, which would make this test's real assertion
+    # vacuous rather than failing.
+    merchants = p.build_merchant_pool(n_merchants=200, drift_rate=0.0)
+    assert {m["country"] for m in merchants} == set(p.COUNTRIES)
+
     card = cards[0]
     t1, t2 = p.fraud_geo_impossible(card, merchants)
     for t in (t1, t2):
@@ -333,3 +416,201 @@ def test_parquet_schema_matches_kafka_json_schema(cards, merchants, tmp_path):
     table = pq.read_table(path)
     assert table.column_names == p.EVENT_FIELDS
     assert table.num_rows == 50
+
+
+# --- Entity stability across runs ---------------------------------------------
+
+def _population(sim_seed: int, n_cards: int = 25, n_merchants: int = 25):
+    """One 'producer run' at a given --seed, with drift off so the comparison
+    is about entity identity rather than attribute drift. The pools are
+    snapshotted as built: a run mutates card dicts in place (trip state,
+    last card-present merchant), which is simulation state, not identity."""
+    p.seed_simulation(sim_seed)
+    cards = p.build_card_pool(n_cards=n_cards)
+    merchants = p.build_merchant_pool(n_merchants=n_merchants, drift_rate=0.0)
+    snapshot = (copy.deepcopy(cards), copy.deepcopy(merchants))
+    events = p.generate_events(400, cards, merchants, fraud_rate=0.015, txns_per_day_per_card=4)
+    return (*snapshot, events)
+
+
+def test_entity_identity_stable_across_seeds_but_transactions_differ():
+    # The reason ids come from the entity RNG instead of uuid4: a warehouse
+    # dimension keyed on card_id/merchant_id must accumulate history across
+    # runs, not meet a fresh set of strangers every time. The transactions
+    # themselves must still be new events.
+    cards_a, merchants_a, events_a = _population(sim_seed=1)
+    cards_b, merchants_b, events_b = _population(sim_seed=2)
+
+    assert {c["card_id"] for c in cards_a} == {c["card_id"] for c in cards_b}
+    assert {m["merchant_id"] for m in merchants_a} == {m["merchant_id"] for m in merchants_b}
+
+    # Stronger than ids alone: the whole master population is reconstructed.
+    assert cards_a == cards_b
+    assert merchants_a == merchants_b
+
+    ids_a = {e["transaction_id"] for e in events_a}
+    ids_b = {e["transaction_id"] for e in events_b}
+    assert not (ids_a & ids_b), "transaction_ids must be per-run unique (uuid4)"
+
+    # And the simulation seed genuinely drives the simulation.
+    assert [e["event_time"] for e in events_a] != [e["event_time"] for e in events_b]
+
+
+def test_entity_pool_is_pure_function_of_seed():
+    # Calling a builder twice in one process must give the same population -
+    # it constructs its RNG locally rather than advancing a shared one.
+    assert p.build_card_pool(n_cards=15) == p.build_card_pool(n_cards=15)
+    assert (p.build_merchant_pool(n_merchants=15, drift_rate=0.0)
+            == p.build_merchant_pool(n_merchants=15, drift_rate=0.0))
+    # A different entity seed is a different population.
+    assert p.build_card_pool(n_cards=15) != p.build_card_pool(n_cards=15, entity_seed=99)
+
+    # Each entity consumes a fixed number of draws, so the first N of a larger
+    # pool are the same entities - shrinking a pool for a test doesn't quietly
+    # change who is in it.
+    assert p.build_card_pool(n_cards=15) == p.build_card_pool(n_cards=50)[:15]
+    assert (p.build_merchant_pool(n_merchants=15, drift_rate=0.0)
+            == p.build_merchant_pool(n_merchants=50, drift_rate=0.0)[:15])
+
+
+def test_entity_ids_are_unique_within_pool():
+    # The ids are drawn from a fixed seed, so a collision would be permanent
+    # rather than intermittent - worth pinning at the real pool sizes.
+    cards = p.build_card_pool(n_cards=500)
+    merchants = p.build_merchant_pool(n_merchants=300, drift_rate=0.0)
+    assert len({c["card_id"] for c in cards}) == 500
+    assert len({m["merchant_id"] for m in merchants}) == 300
+
+
+# --- Dirty-data injection ------------------------------------------------------
+
+def test_dirty_rate_matches_requested(cards, merchants):
+    requested = 0.10
+    events = p.generate_events(3000, cards, merchants, fraud_rate=0.0,
+                                txns_per_day_per_card=4, dirty_rate=requested)
+    auths = [e for e in events if e["event_type"] == "AUTH"]
+    rate = sum(1 for e in auths if p.defects(e)) / len(auths)
+    assert abs(rate - requested) < 0.03, f"dirty rate {rate:.3f} not close to {requested}"
+
+
+def test_dirty_events_carry_exactly_one_defect(cards, merchants):
+    events = p.generate_events(2000, cards, merchants, fraud_rate=0.015,
+                                txns_per_day_per_card=4, dirty_rate=0.25)
+    dirty = [e for e in events if p.defects(e)]
+    assert dirty, "expected some dirty events at dirty_rate=0.25"
+    assert all(len(p.defects(e)) == 1 for e in dirty)
+    # All five defect kinds should show up across a run this size.
+    assert {next(iter(p.defects(e))) for e in dirty} == set(p.DIRTY_DEFECT_MUTATORS)
+
+
+def test_settlements_are_never_dirty(cards, merchants):
+    events = p.generate_events(2000, cards, merchants, fraud_rate=0.015,
+                                txns_per_day_per_card=4, dirty_rate=0.5)
+    settlements = [e for e in events if e["event_type"] == "SETTLEMENT"]
+    assert settlements
+    assert not any(p.defects(e) for e in settlements)
+
+
+def test_default_dirty_rate_produces_no_defects(cards, merchants):
+    events = p.generate_events(1000, cards, merchants, fraud_rate=0.015, txns_per_day_per_card=4)
+    assert not [e for e in events if p.defects(e)]
+
+
+def _settlement_content(events):
+    """Settlements projected onto everything except the uuid4 ids, which are
+    per-run unique by construction and so can't be compared across runs."""
+    return [
+        tuple(e[f] for f in ("event_time", "card_id", "merchant_id", "amount",
+                              "currency", "country", "is_fraud", "fraud_type"))
+        for e in events if e["event_type"] == "SETTLEMENT"
+    ]
+
+
+def test_dirty_injection_leaves_settlement_scheduling_untouched(merchants):
+    # The whole reason corruption happens on a *copy*, downstream of the
+    # generators, and draws from its own RNG: at the same --seed, the clean
+    # and dirty runs must be the same underlying simulation.
+    #
+    # Driven straight off _event_stream with a fixed start_time rather than
+    # through generate_events, which anchors to wall clock (so two calls'
+    # timestamps differ by the real elapsed time between them) and re-sorts by
+    # event_time (which a corrupted timestamp deliberately perturbs). Here the
+    # comparison can be exact and positional, in emission order.
+    def run(dirty_rate):
+        p.seed_simulation(7)
+        cards = p.build_card_pool(n_cards=20)
+        start_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        stream = p._dirty_stream(
+            p._event_stream(cards, merchants, 0.015, 4, p.SETTLEMENT_DELAY_HOURS, start_time),
+            dirty_rate,
+        )
+        events = []
+        for event, _, _ in stream:
+            events.append(event)
+            if len(events) >= 1500:
+                return events
+
+    clean, dirty = run(0.0), run(0.4)
+    assert [e["event_type"] for e in clean] == [e["event_type"] for e in dirty]
+    assert _settlement_content(clean) == _settlement_content(dirty)
+    assert any(p.defects(e) for e in dirty), "dirty run should actually be dirty"
+
+
+def test_dirty_events_still_fit_the_parquet_schema(cards, merchants, tmp_path):
+    # A defect that changed a column's *type* (rather than its value) would
+    # break the bridge file before the warehouse ever sees the bad row.
+    events = p.generate_events(500, cards, merchants, fraud_rate=0.015,
+                                txns_per_day_per_card=4, dirty_rate=0.3)
+    assert any(p.defects(e) for e in events)
+    table = pq.read_table(p.write_parquet(events, tmp_path))
+    assert table.column_names == p.EVENT_FIELDS
+    assert table.num_rows == len(events)
+
+
+def test_message_key_survives_null_card_id():
+    assert p._message_key({"card_id": "card_abc"}) == b"card_abc"
+    assert p._message_key({"card_id": None}) is None
+
+
+# --- Merchant drift ------------------------------------------------------------
+
+def test_merchant_drift_rate_approx_2_percent():
+    drifted = total = 0
+    for seed in range(5):
+        merchants = p.build_merchant_pool(n_merchants=1000, drift_seed=seed)
+        drifted += sum(1 for m in merchants if m["drifted"])
+        total += len(merchants)
+    rate = drifted / total
+    assert abs(rate - p.MERCHANT_DRIFT_RATE) < 0.01, f"drift rate {rate:.4f} not close to 0.02"
+
+
+def test_drift_mutates_exactly_one_attribute_of_the_canonical_pool():
+    baseline = p.build_merchant_pool(n_merchants=100, drift_rate=0.0)
+    drifted = p.build_merchant_pool(n_merchants=100, drift_rate=1.0, drift_seed=3)
+
+    for before, after in zip(baseline, drifted):
+        assert before["merchant_id"] == after["merchant_id"], "drift must not touch identity"
+        assert after["drifted"]
+        changed = {f for f in ("merchant_name", "mcc") if before[f] != after[f]}
+        assert len(changed) == 1, f"expected exactly one drifted attribute, got {changed}"
+
+
+def test_no_drift_when_rate_is_zero():
+    assert (p.build_merchant_pool(n_merchants=100, drift_rate=0.0)
+            == p.build_merchant_pool(n_merchants=100, drift_rate=0.0, drift_seed=11))
+
+
+def test_drift_persists_across_a_run(cards):
+    # Drift is only meaningful if every transaction at a merchant carries the
+    # drifted attributes for the whole run - including mcc_description, which
+    # base_txn derives from the (drifted) mcc rather than storing.
+    merchants = p.build_merchant_pool(n_merchants=20, drift_rate=1.0, drift_seed=5)
+    by_id = {m["merchant_id"]: m for m in merchants}
+    events = p.generate_events(1500, cards, merchants, fraud_rate=0.015, txns_per_day_per_card=4)
+
+    assert events
+    for e in events:
+        merchant = by_id[e["merchant_id"]]
+        assert e["merchant_name"] == merchant["merchant_name"]
+        assert e["mcc"] == merchant["mcc"]
+        assert e["mcc_description"] == p.MCC[merchant["mcc"]]

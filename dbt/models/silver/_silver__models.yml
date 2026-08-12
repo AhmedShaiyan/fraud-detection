@@ -4,7 +4,8 @@ models:
   - name: slv_authorizations
     description: >
       One row per AUTH event, typed and card_id hashed. Incremental, merged
-      on transaction_id.
+      on transaction_id. Rows failing macros/transaction_validity.sql are
+      excluded here and held in slv_quarantine instead of being dropped.
     columns:
       - name: transaction_id
         data_tests:
@@ -30,8 +31,12 @@ models:
   - name: slv_settlements
     description: >
       One row per SETTLEMENT event, typed and card_id hashed. Incremental,
-      merged on transaction_id. ~0.5% of rows are orphan force-posts whose
-      auth_transaction_id matches no real AUTH (see relationships test below).
+      merged on transaction_id. Rows failing macros/transaction_validity.sql
+      are excluded here and held in slv_quarantine instead of being dropped.
+      ~0.5% of rows are orphan force-posts whose auth_transaction_id matches
+      no real AUTH (see relationships test below); note that running the
+      producer with --dirty-rate adds more, since a settlement whose AUTH was
+      quarantined has nothing left to match.
     columns:
       - name: transaction_id
         data_tests:
@@ -57,3 +62,31 @@ models:
                 field: transaction_id
               config:
                 severity: warn
+
+  - name: slv_quarantine
+    description: >
+      Bronze rows failing any check in macros/transaction_validity.sql, held
+      with the reasons they failed rather than dropped. Values are kept raw
+      (uncast) so the malformed value itself is preserved; card_id is hashed
+      as everywhere else in Silver. Incremental, merged on quarantine_key -
+      transaction_id is nullable here by definition, so it cannot be the
+      merge key.
+    columns:
+      - name: quarantine_key
+        description: >
+          sha2 of the row's identifying columns plus _source_file. Surrogate
+          grain key, since no natural key is guaranteed present on a
+          malformed row.
+        data_tests:
+          - unique
+          - not_null
+      - name: quarantine_reasons
+        description: Array of failed check names; never empty by construction.
+        data_tests:
+          - not_null
+      - name: quarantined_at
+        description: >
+          When the row first failed. Held stable across re-runs via
+          merge_exclude_columns.
+        data_tests:
+          - not_null

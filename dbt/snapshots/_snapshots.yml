@@ -1,0 +1,25 @@
+version: 2
+
+snapshots:
+  - name: merchants_snapshot
+    description: >
+      Type-2 SCD history of the merchant master, built on
+      stg_merchants_current with the check strategy over (merchant_name, mcc).
+      One row per merchant version; dbt_valid_from/dbt_valid_to bound each
+      version and the open version has a null dbt_valid_to. A new version only
+      appears when a merchant is next seen with different attributes, which
+      needs at least two producer runs plus a snapshot between them (see
+      README). Lands in fraud.silver.
+    columns:
+      - name: dbt_scd_id
+        description: Surrogate key, one per merchant version.
+        data_tests:
+          - unique
+          - not_null
+      - name: merchant_id
+        description: >
+          Stable across producer runs (fixed ENTITY_SEED), which is what lets
+          this table accumulate history rather than collect strangers. Not
+          unique here by design - one row per version.
+        data_tests:
+          - not_null

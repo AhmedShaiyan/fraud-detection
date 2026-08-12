@@ -44,6 +44,11 @@
 -- transactions. implied_speed_kmh is therefore null for CNP rows and is
 -- computed against the nearest PRIOR card-present row (lag ... ignore
 -- nulls), not simply the immediately-preceding row of any kind.
+--
+-- A legitimate transaction following a fraudulent one inherits an anomalous
+-- implied_speed_kmh, because the fraud moved the card but not the cardholder
+-- - a realistic false-positive source, retained deliberately rather than
+-- engineered away (see tests/assert_normal_implied_speed_within_ceiling.sql).
 
 with auths as (
 

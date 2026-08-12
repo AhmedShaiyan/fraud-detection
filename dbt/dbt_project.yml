@@ -36,8 +36,21 @@ vars:
   # duration, so this threshold no longer needs to be compressed to match it.
   recon_maturity_minutes: 10080
 
+  # Currencies the warehouse accepts. Enforced by
+  # macros/transaction_validity.sql (rows carrying anything else are
+  # quarantined, not dropped); mirrored on the producer side by
+  # VALID_CURRENCIES in producer.py.
+  valid_currencies: ['SGD', 'MYR', 'IDR', 'THB', 'USD', 'GBP', 'AUD']
+
 models:
   fraud_detection:
+    stg:
+      # Thin, non-materialized reshapes of Silver. Views, so they always
+      # reflect the current state of the model underneath rather than
+      # needing their own refresh - which matters for the merchant master
+      # the snapshot reads.
+      +materialized: view
+      +schema: silver
     silver:
       +materialized: incremental
       +incremental_strategy: merge
