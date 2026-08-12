@@ -1,0 +1,7 @@
+# Great Expectations gate against fraud.gold (CLAUDE.md: pinned requirements.txt
+# per service). databricks-sql-connector/pandas/python-dotenv pinned to the
+# versions already validated elsewhere in this project's environment.
+great-expectations==1.20.0
+databricks-sql-connector==3.6.0
+pandas==2.2.3
+python-dotenv==1.0.1
