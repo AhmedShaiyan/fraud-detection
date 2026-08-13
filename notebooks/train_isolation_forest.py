@@ -55,6 +55,21 @@ FEATURES = [
     "has_history",
 ]
 
+# Deterministic rules layered on top of the model (hybrid scoring). Same
+# contract role as FEATURES - FastAPI replicates these thresholds directly
+# in Week 4. `df[column] > threshold` is False for a null column value in
+# pandas, so GEO_RULE/AMOUNT_RULE skip null rows with no extra guarding.
+#
+# VELOCITY_RULE at > 2, not > 5: txn_count_1h excludes self, so a 5-event
+# burst peaks at count 4 and never reaches > 5 - that threshold missed short
+# bursts entirely. > 2 catches burst rows from the 3rd event onward, well
+# above the normal per-card baseline (~0.16).
+RULES = {
+    "VELOCITY_RULE": {"column": "txn_count_1h", "threshold": 2},
+    "GEO_RULE": {"column": "implied_speed_kmh", "threshold": 1500},
+    "AMOUNT_RULE": {"column": "amount_vs_avg_24h_ratio", "threshold": 15},
+}
+
 FRAUD_TYPES = ["velocity", "geo_impossible", "amount_anomaly"]
 
 # Below the table's actual ~4.6% fraud rate on purpose - flagging the true
@@ -219,6 +234,75 @@ print(threshold_sweep_df.to_string(index=False))
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Hybrid scoring: rules + model
+# MAGIC
+# MAGIC A transaction is flagged if the model flags it OR any RULES threshold
+# MAGIC fires. Rules are evaluated on holdout_df's raw feature values (not the
+# MAGIC imputed X_holdout), since they're meant to run on real incoming values,
+# MAGIC same as they will in FastAPI.
+
+# COMMAND ----------
+
+def evaluate_rules(df: pd.DataFrame) -> pd.DataFrame:
+    """One boolean column per RULES entry."""
+    return pd.DataFrame({
+        name: df[spec["column"]] > spec["threshold"]
+        for name, spec in RULES.items()
+    })
+
+
+rule_flag = evaluate_rules(holdout_df).any(axis=1).to_numpy()
+combined_flag = holdout_pred_flag | rule_flag
+
+comparison_rows = []
+for ftype in FRAUD_TYPES:
+    mask = (holdout_df["fraud_type"] == ftype).to_numpy()
+    n_actual = int(mask.sum())
+    comparison_rows.append({
+        "fraud_type": ftype,
+        "n_actual": n_actual,
+        "recall_rules_only": float(rule_flag[mask].mean()) if n_actual else float("nan"),
+        "recall_model_only": float(holdout_pred_flag[mask].mean()) if n_actual else float("nan"),
+        "recall_hybrid": float(combined_flag[mask].mean()) if n_actual else float("nan"),
+    })
+hybrid_recall_df = pd.DataFrame(comparison_rows)
+print(hybrid_recall_df.to_string(index=False))
+
+hybrid_summary_rows = []
+for label, flag in [("rules_only", rule_flag), ("model_only", holdout_pred_flag), ("hybrid", combined_flag)]:
+    tn, fp, fn, tp = confusion_matrix(y_holdout, flag).ravel()
+    hybrid_summary_rows.append({
+        "scorer": label,
+        "precision": tp / (tp + fp) if (tp + fp) else float("nan"),
+        "recall": tp / (tp + fn) if (tp + fn) else float("nan"),
+        "fpr": fp / (fp + tn) if (fp + tn) else float("nan"),
+    })
+hybrid_summary_df = pd.DataFrame(hybrid_summary_rows)
+print(f"\n{hybrid_summary_df.to_string(index=False)}")
+
+print(
+    "\nVELOCITY_RULE and GEO_RULE catch velocity/geo_impossible outright once "
+    "a burst or jump crosses its threshold, deterministically and without the "
+    "model. AMOUNT_RULE catches most amount_anomaly the same way. The model "
+    "is what catches the rest: the first couple of rows in each burst before "
+    "txn_count_1h passes 2, and anything under a rule's threshold that's "
+    "still multivariately odd."
+)
+
+hybrid_recall_by_type = dict(zip(hybrid_recall_df["fraud_type"], hybrid_recall_df["recall_hybrid"]))
+hybrid_overall = hybrid_summary_df.set_index("scorer").loc["hybrid"]
+hybrid_metrics = {
+    "hybrid_overall_precision": hybrid_overall["precision"],
+    "hybrid_overall_recall": hybrid_overall["recall"],
+    "hybrid_overall_fpr": hybrid_overall["fpr"],
+    "hybrid_recall_velocity": hybrid_recall_by_type["velocity"],
+    "hybrid_recall_geo_impossible": hybrid_recall_by_type["geo_impossible"],
+    "hybrid_recall_amount_anomaly": hybrid_recall_by_type["amount_anomaly"],
+}
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## MLflow tracking + Unity Catalog registration
 # MAGIC
 # MAGIC Registers to `fraud.gold.isolation_forest`. `@champion` promotion here is
@@ -266,6 +350,7 @@ with mlflow.start_run(run_name="isolation_forest_train") as run:
         }
     )
     mlflow.log_metrics(run_metrics)
+    mlflow.log_metrics(hybrid_metrics)
     mlflow.log_table(threshold_sweep_df, artifact_file="threshold_sweep.json")
 
     signature = infer_signature(X_train, model.predict(X_train))
@@ -319,6 +404,8 @@ scored_holdout_df = holdout_df[
 ].copy()
 scored_holdout_df["anomaly_score"] = holdout_anomaly_score
 scored_holdout_df["predicted_fraud"] = holdout_pred_flag
+scored_holdout_df["rule_flag"] = rule_flag
+scored_holdout_df["combined_flag"] = combined_flag
 scored_holdout_df["model_name"] = MODEL_NAME
 scored_holdout_df["model_version"] = registered_version.version
 scored_holdout_df["mlflow_run_id"] = run.info.run_id
@@ -329,6 +416,12 @@ nonfraud_rows = scored_holdout_df[~scored_holdout_df["is_fraud"].astype(bool)].s
     random_state=RANDOM_STATE,
 )
 scored_sample_df = pd.concat([fraud_rows, nonfraud_rows], ignore_index=True)
+
+# spark.createDataFrame can't JSON-serialize Decimal (amount, from the
+# warehouse's decimal(12,2) column) during schema inference - cast to float.
+for col in scored_sample_df.columns:
+    if pd.api.types.infer_dtype(scored_sample_df[col], skipna=True) == "decimal":
+        scored_sample_df[col] = scored_sample_df[col].astype(float)
 
 spark.createDataFrame(scored_sample_df).write.mode("overwrite").saveAsTable(SCORED_SAMPLE_TABLE)
 print(f"wrote {len(scored_sample_df)} rows ({len(fraud_rows)} fraud, {len(nonfraud_rows)} non-fraud) to {SCORED_SAMPLE_TABLE}")
