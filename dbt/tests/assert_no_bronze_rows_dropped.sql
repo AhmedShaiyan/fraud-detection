@@ -1,26 +1,14 @@
--- The other half of the no-silent-drops guarantee: every Bronze row reaches
--- somewhere. Disjointness alone would still be satisfied by a row that landed
--- in neither place, which is the more dangerous failure - a row that vanishes
--- leaves nothing behind to notice.
+-- Other half of the no-silent-drops guarantee: every Bronze row reaches
+-- somewhere (disjointness alone doesn't rule out a row landing in neither
+-- place). Justifies the UNKNOWN_EVENT_TYPE check in
+-- macros/transaction_validity.sql - without it, an unrecognized event_type
+-- would match no Silver model and no validity check.
 --
--- This is the test that justifies the UNKNOWN_EVENT_TYPE check in
--- macros/transaction_validity.sql: the Silver models split Bronze on
--- event_type, so without that check a row with an unrecognized event_type
--- would match neither Silver model and fail no validity check either, and
--- would show up here.
---
--- Written as anti-joins rather than a count reconciliation (bronze total =
--- auths + settlements + quarantine) on purpose: the Silver models merge on
--- transaction_id, so a duplicate id landed twice in Bronze collapses to one
--- Silver row and would break a count comparison while nothing was actually
--- dropped. Existence is the property being asserted, so test existence.
---
--- Null transaction_ids are excluded because they cannot be matched by id.
--- They are covered by construction: NULL_TRANSACTION_ID is itself a
--- quarantine reason, so such a row is always captured.
---
--- Expect this to fail if it runs against a Bronze table that has been loaded
--- since the last dbt run - it is a post-transform gate, not a standalone one.
+-- Anti-joins, not a count reconciliation: a duplicate id landing twice in
+-- Bronze merges to one Silver row and would break a count comparison though
+-- nothing was dropped. Null transaction_ids excluded (covered by
+-- construction). Post-transform gate - expect failures against Bronze
+-- loaded since the last dbt run.
 
 select
     bronze.transaction_id,

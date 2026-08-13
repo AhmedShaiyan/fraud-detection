@@ -1,0 +1,8 @@
+# Isolation Forest training notebook (CLAUDE.md: pinned requirements.txt per
+# service). Not pip-installed from this file directly - the notebook installs
+# these same pins itself via a `%pip install` cell so it works whether it's
+# opened via plain Import or a Git-folder checkout. Kept here for local
+# linting/reproducibility and so the pins are reviewable in a diff.
+scikit-learn==1.9.0
+mlflow==3.15.1
+pandas==2.2.3

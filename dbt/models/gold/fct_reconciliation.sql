@@ -4,33 +4,15 @@
   )
 }}
 
--- materialized='table' (full rebuild every run), not incremental: recon_status
--- is partly a function of current_timestamp() (an unsettled auth is
--- PENDING_SETTLEMENT vs AUTH_NO_SETTLEMENT depending on how much time has
--- elapsed since it happened), so a row's correct status changes between runs
--- even though the underlying auth/settlement rows never do. An incremental
--- append would freeze old rows at whatever status they had the day they were
--- inserted. At production scale the fix isn't "materialize everything
--- forever" but an incremental model with a lookback window: only rebuild
--- auths from the last N days, since anything older than the maturity window
--- is final and never needs to be revisited.
+-- Full rebuild every run, not incremental: recon_status depends on
+-- current_timestamp() (PENDING_SETTLEMENT vs AUTH_NO_SETTLEMENT), so a row's
+-- correct status can change between runs. At production scale, use
+-- incremental with a lookback window instead of full materialization.
 --
--- ORPHAN_SETTLEMENT conflates two different things, and it is worth knowing
--- which one you are looking at. The intended meaning is a force post: a
--- settlement the network pushed through with no prior authorization. But this
--- model reads slv_authorizations, which excludes rows held in slv_quarantine
--- (macros/transaction_validity.sql) - so an AUTH that arrived malformed is
--- absent from the auth side while its settlement still arrives, matches
--- nothing, and lands in this same bucket. Those are opposite operational
--- problems: one is payment-network behavior to reconcile, the other is a
--- data-quality incident to fix upstream. Running the producer with
--- --dirty-rate > 0 makes the second kind appear.
---
--- Future refinement (not implemented): left join the unmatched settlements to
--- slv_quarantine on auth_transaction_id = quarantine.transaction_id and split
--- the status into ORPHAN_SETTLEMENT vs QUARANTINED_AUTH, so the break report
--- routes each to the right owner instead of blaming the network for a bad
--- record.
+-- ORPHAN_SETTLEMENT conflates two cases: true force posts, and settlements
+-- whose AUTH was quarantined as malformed (slv_quarantine excludes it from
+-- slv_authorizations). Not split today; would need a left join to
+-- slv_quarantine on auth_transaction_id.
 
 with auths as (
 
@@ -58,12 +40,8 @@ settlements as (
 
 joined as (
 
-    -- Grain: one row per AUTH transaction plus one row per orphan
-    -- SETTLEMENT (a settlement whose auth_transaction_id matches no real
-    -- AUTH). The full outer join on transaction_id = auth_transaction_id
-    -- is exactly that grain: every AUTH gets a row (matched to 0 or 1
-    -- settlements), and every SETTLEMENT with no matching AUTH gets its own
-    -- row via the right-side-only outer join results.
+    -- Grain: one row per AUTH plus one row per orphan SETTLEMENT (no
+    -- matching auth_transaction_id) via the full outer join.
     select
         auths.transaction_id            as auth_txn_id_from_auth,
         settlements.auth_transaction_id as auth_txn_id_from_settlement,
@@ -84,15 +62,9 @@ joined as (
 enriched as (
 
     select
-        -- True to its name: null for ORPHAN_SETTLEMENT rows, where no auth
-        -- exists. Do not coalesce in the settlement's (unmatched)
-        -- auth_transaction_id here - that would make this column lie for
-        -- orphans to anyone joining it back to slv_authorizations.
         auth_txn_id_from_auth as auth_transaction_id,
         settlement_transaction_id,
-        -- The grain/uniqueness key: every row has an auth_transaction_id or
-        -- a settlement_transaction_id (never neither, per the outer join),
-        -- never both referring to different things.
+        -- Grain/uniqueness key: every row has an auth or settlement id, never neither.
         coalesce(auth_txn_id_from_auth, settlement_transaction_id) as recon_key,
         coalesce(auth_card_id_hash, settlement_card_id_hash) as card_id_hash,
         auth_amount,

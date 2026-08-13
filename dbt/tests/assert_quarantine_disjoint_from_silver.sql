@@ -1,13 +1,8 @@
--- Half of the no-silent-drops guarantee: a transaction is either clean and in
--- Silver, or bad and in quarantine, never both. Both sides filter on the same
--- macro (macros/transaction_validity.sql), one negated, so an overlap means
--- those two filters have stopped being exact complements - the failure this
--- whole design is built to make impossible.
---
--- Fails if any transaction_id appears in slv_quarantine and in a Silver
--- model. Rows with a null transaction_id are excluded because they cannot be
--- compared by id at all; those are covered by construction (a null id is
--- itself a quarantine reason, so they can never reach a Silver model).
+-- Half of the no-silent-drops guarantee: a transaction is either clean (in
+-- Silver) or bad (in quarantine), never both - both sides filter on
+-- macros/transaction_validity.sql, one negated. Fails if any transaction_id
+-- appears in both. Null transaction_ids are excluded (covered by
+-- construction: a null id is itself a quarantine reason).
 
 with quarantined as (
 

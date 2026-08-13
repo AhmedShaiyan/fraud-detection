@@ -1,9 +1,6 @@
--- AUTH-side events only.
---
--- Rows failing any check in macros/transaction_validity.sql are excluded here
--- and captured by slv_quarantine, which filters on the exact negation of the
--- same macro call - so this model never defines "valid" for itself, and a bad
--- row is held for inspection rather than dropped.
+-- AUTH-side events only. Rows failing macros/transaction_validity.sql are
+-- excluded here and captured by slv_quarantine (same macro, negated) rather
+-- than dropped.
 
 with source as (
 
@@ -21,10 +18,8 @@ with source as (
 select
     transaction_id,
     event_type,
-    -- try_cast, not cast: identical to cast for rows that reach here (the
-    -- validity filter already guarantees this parses), but it cannot raise
-    -- under ANSI mode if the optimizer evaluates the projection before the
-    -- filter.
+    -- try_cast, not cast: can't raise under ANSI mode if the optimizer
+    -- evaluates the projection before the validity filter.
     try_cast(event_time as timestamp) as event_time,
     sha2(card_id, 256) as card_id_hash,
     merchant_id,

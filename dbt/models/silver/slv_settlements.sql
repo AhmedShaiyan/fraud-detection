@@ -1,10 +1,6 @@
--- SETTLEMENT-side events only. lat/lon/channel/pos_entry_mode/card_present/
--- auth_code are excluded.
---
--- Rows failing any check in macros/transaction_validity.sql are excluded here
--- and captured by slv_quarantine, which filters on the exact negation of the
--- same macro call - so this model never defines "valid" for itself, and a bad
--- row is held for inspection rather than dropped.
+-- SETTLEMENT-side events only (lat/lon/channel/pos_entry_mode/card_present/
+-- auth_code excluded). Rows failing macros/transaction_validity.sql are
+-- excluded here and captured by slv_quarantine (same macro, negated).
 
 with source as (
 
@@ -36,9 +32,7 @@ select
     _ingested_at,
     _source_file,
 
-    -- LEAKAGE WARNING: is_fraud/fraud_type are ground-truth labels, kept
-    -- here only for offline evaluation. Never join these into a feature
-    -- table used at inference time.
+    -- LEAKAGE WARNING: ground-truth labels, offline evaluation only.
     is_fraud,
     fraud_type
 

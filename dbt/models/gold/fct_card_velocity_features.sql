@@ -1,54 +1,31 @@
 {{ config(materialized='table') }}
 
--- materialized='table': full rebuild every run. Window aggregates depend on
--- a card's entire ordered history, and at this project's data volume a full
--- rebuild is cheap and removes any risk of a late-arriving/out-of-order
--- backfilled auth silently leaving downstream rows' point-in-time features
--- stale under an incremental/merge strategy. At production scale:
--- incremental with a bounded lookback window per card_id_hash, same
--- tradeoff as fct_reconciliation.
+-- Full rebuild every run: window aggregates depend on a card's entire
+-- ordered history, and a late/out-of-order backfilled auth would otherwise
+-- leave downstream rows stale under incremental. At production scale, use a
+-- bounded lookback window per card_id_hash instead (same tradeoff as
+-- fct_reconciliation).
 --
--- Training-serving parity: this table is the offline training feature
--- source only. A real-time scoring endpoint does not have a ready-made
--- trailing window for a brand-new incoming transaction; serving needs
--- either a live per-card feature cache (e.g. Redis, updated by the stream)
--- or point-in-time recomputation at request time. Training on these Gold
--- features and serving off a differently-computed online store is a
--- training-serving skew risk that has to be resolved explicitly if this
--- project reaches a serving stage.
+-- Training-serving parity: this is the offline training feature source
+-- only. A real-time scorer needs its own live feature cache or point-in-time
+-- recomputation - training here and serving off a differently-computed
+-- store is a skew risk to resolve explicitly at serving time.
 --
--- Same-second tie caveat: event_time ties (same card, same second) are
--- ordered arbitrarily by Spark within the window. RANGE frames whose upper
--- bound is CURRENT ROW treat same-second peers as mutually visible to each
--- other (SQL RANGE semantics include every row tied on the ORDER BY value,
--- not just ones physically earlier) - so txn_count_1h/24h, amount_sum/avg_24h
--- and has_history (all built as an inclusive RANGE-to-CURRENT-ROW count minus
--- exactly one unit for self) correctly see same-second peers as concurrent
--- history. distinct_countries_24h and the LAG-based recency features
--- (minutes_since_last_txn, implied_speed_kmh) instead use a frame/offset
--- that stops strictly before the current row's value, so same-second peers
--- are invisible to each other there (a same-second burst won't register as
--- a new country or a nonzero speed until the next second's row). has_history
--- deliberately uses the RANGE-count technique rather than a LAG(...) IS NOT
--- NULL check for this reason: LAG only sees the one physically-preceding
--- row, so the physically-first row in a same-second burst would otherwise
--- report has_history=false while its RANGE-based txn_count_1h/24h already
--- count the other rows in that same burst - an inconsistency that would
--- break the "has_history=false implies null aggregates" invariant.
+-- Same-second ties: RANGE frames ending at CURRENT ROW treat same-second
+-- peers as visible to each other, so txn_count_1h/24h/amount_sum_24h/
+-- has_history (inclusive RANGE minus self) see same-second peers as
+-- history. distinct_countries_24h and the LAG-based recency features stop
+-- strictly before the current row instead, so same-second peers are
+-- invisible there. has_history uses the RANGE-count technique (not a LAG
+-- NULL check) so it stays consistent with txn_count_1h/24h under ties.
 --
--- Card-present-only implied_speed_kmh: a card-not-present (online) auth's
--- merchant coordinates don't locate the cardholder at all - the cardholder
--- could be anywhere, so measuring distance/time to or from a CNP row
--- produces a physically meaningless number, mirroring how production
--- card-network geo-velocity checks only compare physically-present
--- transactions. implied_speed_kmh is therefore null for CNP rows and is
--- computed against the nearest PRIOR card-present row (lag ... ignore
--- nulls), not simply the immediately-preceding row of any kind.
---
--- A legitimate transaction following a fraudulent one inherits an anomalous
--- implied_speed_kmh, because the fraud moved the card but not the cardholder
--- - a realistic false-positive source, retained deliberately rather than
--- engineered away (see tests/assert_normal_implied_speed_within_ceiling.sql).
+-- implied_speed_kmh is null for card-not-present rows (merchant coords
+-- don't locate a CNP cardholder) and is computed against the nearest prior
+-- card-present row via `lag ... ignore nulls`, not the immediately
+-- preceding row. A legitimate transaction right after a fraudulent one
+-- inherits an anomalous speed (the fraud moved the card, not the
+-- cardholder) - a realistic false positive, kept deliberately (see
+-- tests/assert_normal_implied_speed_within_ceiling.sql).
 
 with auths as (
 
@@ -92,17 +69,14 @@ windowed as (
             partition by card_id_hash order by event_time_unix
             range between unbounded preceding and current row
         ) as historical_txn_count_incl,
-        -- "prior window": stops 1 second short of current row's value, so
-        -- (unlike the inclusive-then-subtract-self counts above) this
-        -- excludes same-second peers entirely, not just this one row.
+        -- Stops 1 second short of current row, unlike the inclusive counts above -
+        -- excludes same-second peers entirely, not just this row.
         size(collect_set(country) over (
             partition by card_id_hash order by event_time_unix
             range between 86400 preceding and 1 preceding
         )) as distinct_countries_24h,
         lag(event_time_unix) over (partition by card_id_hash order by event_time_unix) as prev_event_time_unix,
-        -- Nearest PRIOR card-present row's time/lat/lon, skipping over any
-        -- CNP rows in between (see header comment) - not simply the
-        -- immediately-preceding row like prev_event_time_unix above.
+        -- Nearest PRIOR card-present row's time/lat/lon, skipping CNP rows in between.
         lag(case when card_present then event_time_unix end) ignore nulls over (
             partition by card_id_hash order by event_time_unix
         ) as prev_present_event_time_unix,
@@ -133,9 +107,7 @@ features as (
         case when prev_event_time_unix is not null
             then (event_time_unix - prev_event_time_unix) / 60.0
         end as minutes_since_last_txn,
-        -- Card-present rows only, on both ends: null for CNP rows
-        -- themselves and for any row with no prior card-present event to
-        -- compare against (see header comment).
+        -- Card-present rows only, on both ends (see header comment).
         case when card_present and prev_present_event_time_unix is not null
             then {{ haversine_km('prev_present_lat', 'prev_present_lon', 'lat', 'lon') }}
                  / nullif((event_time_unix - prev_present_event_time_unix) / 3600.0, 0)
@@ -144,11 +116,7 @@ features as (
         (channel = 'ONLINE') as is_online,
         (mcc in ('5967', '5732', '4511')) as is_high_risk_mcc,
         (auth_code <> '00') as was_declined,
-        -- Same inclusive-RANGE-minus-self technique as txn_count_1h/24h,
-        -- just unbounded, so it stays consistent with them under
-        -- same-second ties (see header comment) and guarantees
-        -- has_history=false implies zero rows in every trailing window,
-        -- including the ones amount_avg_24h/txn_count_24h are built from.
+        -- Same inclusive-RANGE-minus-self technique as txn_count_1h/24h, unbounded.
         (historical_txn_count_incl - 1) > 0 as has_history,
         is_fraud,
         fraud_type
@@ -177,9 +145,7 @@ select
     was_declined,
     has_history,
 
-    -- LEAKAGE WARNING: is_fraud/fraud_type are ground-truth labels, carried
-    -- through for evaluation/join-back only. Never use as model input
-    -- features - the training notebook must exclude these two columns.
+    -- LEAKAGE WARNING: ground-truth labels, for evaluation only - never a model input.
     is_fraud,
     fraud_type
 

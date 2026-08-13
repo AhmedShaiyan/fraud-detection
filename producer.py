@@ -1,71 +1,36 @@
 """
-Synthetic card transaction producer.
+Synthetic card transaction producer. Streams AUTH/SETTLEMENT events to the
+`transactions` Kafka topic, keyed by card_id (per-card ordering).
 
-Generates realistic card transactions and streams them to the `transactions`
-Kafka topic, keyed by card_id (per-card ordering within a partition).
+Every txn starts as an AUTH. Approved auths (auth_code == "00") settle ~95%
+of the time after a real 2-48h delay; declined auths never settle. ~0.5% of
+settlements are orphans (no matching auth). Settlement amount is a mixture:
+most clear exactly, ~25% carry small FX/rounding drift, ~5% a tip at
+restaurants/hotels (see settlement_drift). AUTH/SETTLEMENT share one schema
+(unused fields null), so Kafka JSON and the --parquet-out file match shape.
 
-Event model: every transaction starts life as an AUTH. Approved AUTHs
-(auth_code == "00") settle ~95% of the time after a real 2-48h delay;
-declined AUTHs never settle. A small fraction (~0.5%) of SETTLEMENTs are
-orphans that reference no real AUTH (force posts). Most settlements clear for
-exactly the authorized amount; ~25% carry small FX/rounding drift and ~5% a
-tip at restaurants/hotels (see settlement_drift). AUTH and SETTLEMENT events
-share one unified schema (fields that don't apply to a given event type are
-null), so the Kafka JSON and the --parquet-out Parquet file are the same
-shape.
+Runs on a unified synthetic clock: every duration (transaction cadence,
+settlement delay, flight time) is real-scale, driven by one min-heap
+(_event_stream) that always knows what happens next across every card.
+--time-compression only affects Kafka mode's sleep pacing; --parquet-out
+never sleeps.
 
-Unified synthetic clock: every duration in the simulation (per-card
-transaction cadence, settlement delay, flight-travel gating) runs at real
-scale - a card transacts ~4x/day on average, settlement takes a real 2-48h,
-a flight takes a real haversine-distance-based number of hours. A single
-min-heap (see _event_stream) always knows exactly what happens next, across
-every card, in chronological synthetic order. The only place "compression"
-exists at all is Kafka mode's real-time pacing: --time-compression says how
-many synthetic seconds equal one real wall-clock second when sleeping
-between emits. --parquet-out mode never sleeps, so it just runs the same
-synthetic timeline as fast as it can, anchored so it ends near generation
-wall time.
+Four independent RNG streams, so each knob only perturbs its own draws:
+  1. entity     - fixed ENTITY_SEED, builds the card/merchant pools (ids
+                   included) identically every run, so they're stable
+                   warehouse dimension keys.
+  2. simulation - --seed (fresh entropy by default). Arrival times, amounts,
+                   countries, fraud draws, settlement decisions.
+  3. dirty      - fixed DIRTY_SEED, see --dirty-rate. Separate so enabling it
+                   doesn't change which transactions get generated.
+  4. drift      - unseeded by default, see MERCHANT_DRIFT_RATE.
 
-Four independent random streams, so that turning one knob never silently
-reshuffles another part of the simulation:
-  1. entity      - fixed ENTITY_SEED, drives build_card_pool/build_merchant_pool
-                    entirely (including the ids themselves). Every run, at any
-                    --seed, reconstructs the identical card/merchant master
-                    population, so card_id/merchant_id are stable join keys
-                    across runs and a warehouse dimension built from them
-                    accumulates history instead of a fresh set of strangers.
-  2. simulation  - --seed (default: fresh entropy per run). Arrival times,
-                    amounts, countries, fraud draws, settlement decisions.
-  3. dirty       - fixed DIRTY_SEED, see --dirty-rate. Held separate so that
-                    enabling dirty injection does not consume simulation draws
-                    and therefore does not change which transactions get
-                    generated: a --dirty-rate 0 run and a --dirty-rate 0.3 run
-                    at the same --seed are the same underlying simulation.
-  4. drift       - unseeded per run by default, see MERCHANT_DRIFT_RATE.
+transaction_id is always a fresh uuid4, even at a fixed --seed.
 
-transaction_id stays uuid4 (not drawn from any of the four): every event is a
-new event, so ids are deliberately unique per run even at a fixed --seed.
-
-Data-quality defects (--dirty-rate) are injected at emission time, on a copy
-of an already-valid AUTH, downstream of the generators - so a corrupted event
-goes out on the wire while the settlement scheduled off its pristine original
-is unaffected. See _dirty_stream.
-
-Merchant drift (MERCHANT_DRIFT_RATE) mutates ~2% of merchants' name or MCC
-once per run, against the canonical entity-seeded pool - the run-over-run
-variation a Type-2 SCD merchant snapshot exists to capture.
-
-Fraud patterns injected (each transaction carries a `fraud_type` label so you
-can measure model precision/recall later):
+Fraud patterns injected (~1.5% of stream), each labeled with fraud_type:
   1. velocity        - burst of 5-10 rapid transactions on one card
-  2. geo_impossible  - two transactions minutes apart in distant countries,
-                        with the gap derived from a target implied speed so
-                        the pattern is impossible by construction
-  3. amount_anomaly  - transaction 10-50x the card's typical spend
-
-~1.5% of the stream is fraudulent, roughly matching real-world card fraud
-base rates (real rates are lower still, ~0.1%, which is worth mentioning in
-interviews when discussing class imbalance).
+  2. geo_impossible   - two transactions minutes apart in distant countries
+  3. amount_anomaly   - transaction 10-50x the card's typical spend
 
 Usage:
     python producer.py                                             # ~4 txns/day/card, runs forever
@@ -100,28 +65,20 @@ BOOTSTRAP = "localhost:9092"
 ENTITY_SEED = 42     # card/merchant master population; never varies
 DIRTY_SEED = 1337    # which AUTHs get corrupted, and how
 
-# The simulation stream. Every random draw in this module that is *not* about
-# building entities, corrupting events, or drifting merchants goes through
-# _SIM, so the whole simulation is reproducible from a single --seed while the
-# other three streams stay independent of it. Module-level (rather than
-# threaded through every signature) to keep the generator functions callable
-# as plain functions, matching how they already read.
+# Every random draw not about entities/dirty/drift goes through _SIM, so the
+# whole simulation is reproducible from one --seed. Module-level so generator
+# functions stay plain functions instead of threading an RNG through every call.
 _SIM = random.Random()
 
 
 def _entity_rng(entity_seed: int, stream: str) -> random.Random:
-    """An independent entity sub-stream per pool. Seeding both pools with the
-    plain entity_seed would draw their ids from the same position in the same
-    sequence, so card_id and merchant_id come out sharing leading hex digits -
-    harmless, but it reads like a bug. A string seed is hashed (sha512), so
-    this stays deterministic across runs and processes."""
+    """Independent RNG per entity pool (string-seeded, hashed) so card/merchant
+    ids don't share leading hex digits."""
     return random.Random(f"{entity_seed}:{stream}")
 
 
 def seed_simulation(seed: int | None = None) -> None:
-    """Seed the simulation stream. None (the --seed default) draws fresh OS
-    entropy, so an unseeded run is genuinely different every time; tests seed
-    explicitly. Does not touch the entity/dirty/drift streams."""
+    """Seed the simulation stream only (entity/dirty/drift untouched)."""
     _SIM.seed(seed)
 
 
@@ -129,20 +86,12 @@ def seed_simulation(seed: int | None = None) -> None:
 
 NEVER_SETTLE_RATE = 0.05       # of approved auths, fraction that never settle
 ORPHAN_SETTLEMENT_RATE = 0.005 # independent chance per auth of an orphan settlement
-# Settlement amount drift is a MIXTURE, not one uniform band. Most card
-# settlements clear for exactly the authorized amount; drift is the exception,
-# and it comes from two mechanisms that look nothing alike. Modelling it as a
-# single uniform +/-20% made roughly half of all settlements breach the 10%
-# reconciliation tolerance, i.e. an implied ~50% break rate - no real recon
-# desk would tolerate that, and it drowned the genuinely interesting breaks.
+# Three-way mixture, not one uniform band - a uniform +/-20% band pushed ~50%
+# of settlements past the 10% recon tolerance, drowning the real breaks.
 SETTLEMENT_SMALL_DRIFT_RATE = 0.25    # FX conversion / rounding, either direction
 SETTLEMENT_SMALL_DRIFT = 0.05         # +/- 5%, comfortably inside recon tolerance
 SETTLEMENT_TIP_RANGE = (0.05, 0.25)   # gratuity, always upward
-# Tips only happen where tipping happens. Restaurants and hotels are ~20% of
-# settlements (merchants draw MCCs near-uniformly from the 10 in MCC), so a
-# 25% tip rate at those MCCs works out to ~5% of settlements overall - which
-# is what makes the global mixture land on ~70/25/5 without hard-coding it.
-TIPPABLE_MCCS = ("5812", "7011")      # Restaurants, Hotels
+TIPPABLE_MCCS = ("5812", "7011")      # Restaurants, Hotels; ~20% of settlements -> ~5% tip rate overall
 SETTLEMENT_TIP_RATE_TIPPABLE = 0.25
 SETTLEMENT_DELAY_HOURS = (2, 48)  # real auth->settlement delay range
 
@@ -188,8 +137,8 @@ CHANNELS = ["POS", "ONLINE", "ATM", "CONTACTLESS"]
 CURRENCY_BY_COUNTRY = {"SG": "SGD", "MY": "MYR", "ID": "IDR", "TH": "THB",
                        "US": "USD", "GB": "GBP", "AU": "AUD"}
 
-# Mirrors the valid_currencies dbt var (dbt_project.yml), which is what
-# dbt/macros/transaction_validity.sql enforces in the warehouse.
+# Mirrors the valid_currencies dbt var (dbt_project.yml), enforced in the
+# warehouse by dbt/macros/transaction_validity.sql.
 VALID_CURRENCIES = set(CURRENCY_BY_COUNTRY.values())
 
 # ISO-8583-style auth response codes. "00" = approved; ~4% of auths decline.
@@ -197,8 +146,8 @@ AUTH_CODES = ["00", "05", "51", "14", "61"]
 AUTH_CODE_WEIGHTS = [96, 1, 1, 1, 1]
 
 # Unified event schema: every emitted record has exactly these fields, in this
-# order. Fields that don't apply to a given event_type are null. This is what
-# keeps the Kafka JSON and the Parquet file byte-for-byte the same shape.
+# order (fields that don't apply to a given event_type are null). Keeps the
+# Kafka JSON and the Parquet file the same shape.
 EVENT_FIELDS = [
     "transaction_id", "event_type", "event_time", "auth_transaction_id",
     "card_id", "merchant_id", "merchant_name", "mcc", "mcc_description",
@@ -231,26 +180,10 @@ PARQUET_SCHEMA = pa.schema([
 
 
 def build_card_pool(n_cards: int = 500, entity_seed: int = ENTITY_SEED) -> list[dict]:
-    """Each card gets a home country, a typical spend level, and preferred merchants.
-    Card-level behavioral baselines are what make anomalies detectable.
-
-    Built entirely from a *locally constructed* entity RNG, so this is a pure
-    function of (entity_seed, n_cards): every run rebuilds the identical
-    population, and calling it twice in one process returns the same cards.
-    card_id therefore comes from that RNG rather than uuid4 - a uuid4 id would
-    make every run a fresh set of strangers, and no warehouse dimension keyed
-    on card_id could ever accumulate history. The first N cards of a larger
-    pool are the same cards, so shrinking n_cards for a test is safe.
-
-    current_country/travel_remaining/pending_country/next_available_at are
-    mutable trip state (see _normal_txn_country): a fresh card is home-bound
-    (current_country == home_country) with no pending flight.
-
-    last_present_merchant/last_present_at track the card's most recent
-    card-present (physical) transaction, for ground-speed-limited merchant
-    selection (see _pick_reachable_merchant): a fresh card has no such
-    history yet.
-    """
+    """Build the card pool: home country, spend baseline, preferred MCCs, plus
+    mutable trip/travel-history state. Pure function of (entity_seed, n_cards)
+    via a local entity RNG, so card_id is a stable join key across runs and
+    the first N cards of a larger pool never change."""
     rng = _entity_rng(entity_seed, "cards")
     cards = []
     for _ in range(n_cards):
@@ -273,15 +206,10 @@ def build_card_pool(n_cards: int = 500, entity_seed: int = ENTITY_SEED) -> list[
 def build_merchant_pool(n_merchants: int = 300, entity_seed: int = ENTITY_SEED,
                          drift_rate: float = MERCHANT_DRIFT_RATE,
                          drift_seed: int | None = None) -> list[dict]:
-    """Each merchant gets fixed lat/lon at creation (country reference point
-    plus one-time jitter) - a merchant is a physical place, so every
-    transaction at it should carry exactly the same coordinates.
-
-    Same entity-RNG contract as build_card_pool: the pool is a pure function
-    of (entity_seed, n_merchants), so merchant_id is a stable join key across
-    runs. Merchant *attributes* are then drifted on top of that canonical pool
-    by _apply_merchant_drift.
-    """
+    """Build the merchant pool with fixed lat/lon (country reference point +
+    one-time jitter). Same entity-RNG contract as build_card_pool: pure
+    function of (entity_seed, n_merchants), so merchant_id is a stable join
+    key. Attributes are then drifted on top by _apply_merchant_drift."""
     rng = _entity_rng(entity_seed, "merchants")
     entity_fake = Faker()
     entity_fake.seed_instance(entity_seed)  # instance-local, so drift's Faker can't perturb it
@@ -305,28 +233,15 @@ def build_merchant_pool(n_merchants: int = 300, entity_seed: int = ENTITY_SEED,
 
 def _apply_merchant_drift(merchants: list[dict], drift_rate: float,
                            drift_seed: int | None) -> int:
-    """Mutate each merchant's name or mcc with probability drift_rate, once
-    per run, in place. Returns how many drifted.
+    """Mutate each merchant's name or mcc with probability drift_rate, once per
+    run, in place - the producer half of the Type-2 SCD story the merchant
+    snapshot exists to capture. Non-cumulative: each run drifts the canonical
+    entity-seeded pool fresh, so a merchant can "revert" between runs.
 
-    This is the producer half of the Type-2 SCD story: merchants rebrand and
-    get recategorized, so the merchant master a warehouse sees today is not
-    the one it saw last week, and a snapshot has to version rather than
-    overwrite. mcc_description is not drifted directly - base_txn derives it
-    from MCC[merchant["mcc"]], so it follows the drifted mcc automatically.
-
-    drift_seed=None (the default) draws fresh OS entropy, deliberately unlike
-    every other stream here. The entity pool is reproducible by design, so two
-    runs would otherwise emit an identical merchant master and the snapshot
-    would never see a second version - the one thing it exists to capture.
-    Tests pass an int.
-
-    Drift is non-cumulative: each run mutates the canonical entity-seeded pool
-    fresh, so run N+1's drift is applied to the original attributes rather
-    than to run N's drifted ones. A merchant can therefore "revert" between
-    runs. Acceptable at portfolio scale - the snapshot still versions
-    correctly, it just sees a walk around the canonical values rather than a
-    monotonic one; persisting drift state across runs would mean giving the
-    producer a state file it otherwise does not need.
+    drift_seed=None draws fresh OS entropy by default (unlike every other
+    stream here), since the entity pool is otherwise reproducible and two
+    runs would emit an identical merchant master with nothing for the
+    snapshot to version. Tests pass an int for reproducibility.
     """
     rng = random.Random(drift_seed)
     drift_fake = Faker()
@@ -337,8 +252,7 @@ def _apply_merchant_drift(merchants: list[dict], drift_rate: float,
         if rng.random() >= drift_rate:
             continue
         if rng.random() < 0.5:
-            # Guarded: a "mutation" that lands on the same value would be an
-            # invisible drift, and the snapshot would correctly record nothing.
+            # Guard against a mutation landing on the same value (invisible drift).
             for _ in range(10):
                 new_name = drift_fake.company()
                 if new_name != merchant["merchant_name"]:
@@ -409,8 +323,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def _flight_delay_hours(from_country: str, to_country: str) -> float:
     """Plausible travel time between two countries' reference points, at
-    FLIGHT_SPEED_KMH plus TRAVEL_DELAY_JITTER for boarding/customs/ground time.
-    Always real hours - no compression concept lives at this layer."""
+    FLIGHT_SPEED_KMH plus TRAVEL_DELAY_JITTER. Always real hours."""
     lat1, lon1, _ = COUNTRIES[from_country]
     lat2, lon2, _ = COUNTRIES[to_country]
     return haversine_km(lat1, lon1, lat2, lon2) / FLIGHT_SPEED_KMH * _SIM.uniform(*TRAVEL_DELAY_JITTER)
@@ -418,19 +331,14 @@ def _flight_delay_hours(from_country: str, to_country: str) -> float:
 
 def _normal_txn_country(card: dict, event_time: datetime) -> str:
     """Country for this card's next normal transaction. HOME_COUNTRY_RATE of
-    the time it stays home; otherwise the card enters "travel mode" for a
-    TRAVEL_TRIP_LENGTH run of consecutive normal transactions in one foreign
-    country before returning home.
+    the time it stays home; otherwise enters "travel mode" for a
+    TRAVEL_TRIP_LENGTH run of transactions in one foreign country.
 
-    Cards go quiet while they "fly": a country change (trip start or trip
-    return) doesn't take effect on the transaction that decides it - that
-    transaction stays in the card's current country, and next_available_at
-    is pushed out by a haversine-distance-based real flight delay. The
-    per-card scheduler (_event_stream) never schedules this card's next turn
-    before next_available_at, so the next time this card actually transacts,
-    the pending country becomes current - meaning the transition row itself
-    is correctly separated from the last pre-flight row by a physically
-    plausible elapsed time, not just whatever the next draw happened to be.
+    A country change doesn't take effect on the transaction that decides it -
+    that transaction stays in the current country, and next_available_at is
+    pushed out by a haversine-based flight delay, so the eventual transition
+    row is separated from the last pre-flight row by a physically plausible
+    elapsed time (see _event_stream for the scheduling gate).
     """
     if card["pending_country"] is not None:
         card["current_country"] = card["pending_country"]
@@ -459,17 +367,11 @@ def _normal_txn_country(card: dict, event_time: datetime) -> str:
 def _pick_reachable_merchant(card: dict, eligible: list[dict], target_country: str,
                               event_time: datetime) -> dict:
     """Card-present merchant selection respects ground travel: pick among
-    merchants reachable at GROUND_SPEED_KMH given elapsed time since the
-    card's last card-present event, falling back to that same merchant if
-    nothing in range (never teleport a physically-present card across a
-    country in zero time just because the merchant pool is large).
-
-    No constraint (free pick) when there's no prior card-present event, or
-    when the last one was in a different country - a country change is
-    already physics-gated separately by flight delay (_normal_txn_country),
-    on a wholly different, much larger timescale than ground travel between
-    merchants within one country.
-    """
+    merchants reachable at GROUND_SPEED_KMH since the card's last
+    card-present event, falling back to that same merchant if nothing's in
+    range. Unconstrained when there's no prior card-present event or it was
+    in a different country - country changes are already flight-gated
+    separately in _normal_txn_country."""
     last_merchant = card["last_present_merchant"]
     last_at = card["last_present_at"]
     if last_merchant is None or last_merchant["country"] != target_country:
@@ -503,11 +405,9 @@ def normal_txn(card: dict, merchants: list[dict], ts: datetime | None = None) ->
 
 
 def fraud_velocity(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
-    """5-10 small-to-medium transactions on one card and merchant, spaced
-    VELOCITY_BURST_GAP_SECONDS apart (up to ~4.5 min end-to-end for a 10-txn
-    burst) so implied_speed_kmh-style elapsed-time features see a real,
-    strictly-ascending timeline instead of a same-second pile-up. Classic
-    card-testing / stolen-card cashout pattern."""
+    """5-10 rapid transactions on one card/merchant, spaced
+    VELOCITY_BURST_GAP_SECONDS apart. Classic card-testing / stolen-card
+    cashout pattern."""
     txns = []
     current_ts = ts or datetime.now(timezone.utc)
     merchant = _SIM.choice(merchants)
@@ -523,15 +423,9 @@ def fraud_velocity(card: dict, merchants: list[dict], ts: datetime | None = None
 
 def fraud_geo_impossible(card: dict, merchants: list[dict], ts: datetime | None = None) -> list[dict]:
     """Two transactions in distant countries, with the gap derived from a
-    target implied speed (GEO_IMPOSSIBLE_SPEED_KMH) rather than a fixed time
-    window - gap_hours = haversine_km(c1, c2) / target_speed_kmh guarantees
-    the pattern is impossible BY CONSTRUCTION regardless of which two
-    countries get picked, unlike a fixed gap (which could coincidentally
-    look plausible for nearby countries). Bypasses flight gating entirely
-    (no _normal_txn_country involvement) - that's what makes it impossible
-    instead of a legitimate (gated) trip. Merchants are filtered by country
-    so the merchant-fixed lat/lon actually reflects the intended distant
-    countries, not a random merchant's location."""
+    target implied speed (GEO_IMPOSSIBLE_SPEED_KMH) so the pattern is
+    impossible by construction. Bypasses flight gating entirely - that's what
+    makes it impossible instead of a legitimate trip."""
     base_ts = ts or datetime.now(timezone.utc)
     c1, c2 = _SIM.sample(list(COUNTRIES), 2)
     dist_km = haversine_km(*COUNTRIES[c1][:2], *COUNTRIES[c2][:2])
@@ -575,22 +469,11 @@ def generate_auth_batch(card: dict, merchants: list[dict], fraud_rate: float,
 # --- Settlement generation ------------------------------------------------------
 
 def settlement_drift(auth: dict) -> float:
-    """Fractional difference between the settled and authorized amount, drawn
-    from a three-way mixture (see the constants above):
-
-      ~70%  exact match      - drift 0.0, the settlement clears for exactly
-                               what was authorized
-      ~25%  small drift      - uniform +/- SETTLEMENT_SMALL_DRIFT, FX
-                               conversion and rounding, symmetric because
-                               either side can round in your favour
-      ~5%   tip              - uniform over SETTLEMENT_TIP_RANGE, always
-                               UPWARD (a gratuity only ever increases the
-                               amount) and only at TIPPABLE_MCCS
-
-    The exact/small split is the same everywhere; only the tip branch is
-    MCC-conditional, so the headline 70/25/5 is an emergent average over the
-    MCC mix rather than a hard-coded global constant.
-    """
+    """Fractional diff between settled and authorized amount, drawn from a
+    three-way mixture: ~70% exact (0.0), ~25% small +/-SETTLEMENT_SMALL_DRIFT
+    (FX/rounding), ~5% upward tip over SETTLEMENT_TIP_RANGE at TIPPABLE_MCCS
+    only. The 70/25/5 split is an emergent average, not hard-coded - only the
+    tip branch is MCC-conditional."""
     tip_rate = SETTLEMENT_TIP_RATE_TIPPABLE if auth["mcc"] in TIPPABLE_MCCS else 0.0
     roll = _SIM.random()
     if roll < tip_rate:
@@ -602,15 +485,10 @@ def settlement_drift(auth: dict) -> float:
 
 def decide_settlement(auth: dict, delay_hours_range: tuple[float, float] = SETTLEMENT_DELAY_HOURS
                        ) -> tuple[dict | None, float]:
-    """Decide if/when/how an AUTH settles.
-
-    Declined auths (auth_code != "00") never settle. Approved auths settle
-    ~95% of the time (NEVER_SETTLE_RATE), after a delay drawn uniformly from
-    delay_hours_range real hours, with the amount drifted per the mixture in
-    settlement_drift (most settlements clear exactly; the rest carry FX/
-    rounding noise or a tip). Returns (settlement_dict_or_None, delay_hours) -
-    delay_hours is 0 when there is no settlement.
-    """
+    """Decide if/when/how an AUTH settles. Declined auths never settle;
+    approved ones settle ~95% of the time (NEVER_SETTLE_RATE) after a delay
+    drawn from delay_hours_range, amount drifted per settlement_drift.
+    Returns (settlement_dict_or_None, delay_hours)."""
     if auth["auth_code"] != "00":
         return None, 0
     if _SIM.random() < NEVER_SETTLE_RATE:
@@ -669,10 +547,9 @@ def orphan_settlement(cards: list[dict], merchants: list[dict], ts: datetime | N
 
 # --- Data-quality defect injection ------------------------------------------------
 
-# A timestamp that looks like one but parses as neither ISO-8601 in Python nor
-# a timestamp in Spark (month 13, day 45, hour 99) - `cast(event_time as
-# timestamp)` returns NULL for it, which is exactly what the warehouse-side
-# validity check keys on (dbt/macros/transaction_validity.sql).
+# Looks like a timestamp but parses as neither ISO-8601 in Python nor a Spark
+# timestamp (month 13, day 45, hour 99) - `cast(event_time as timestamp)`
+# returns NULL, which dbt/macros/transaction_validity.sql keys on.
 UNPARSEABLE_EVENT_TIME = "2026-13-45 99:99:99"
 
 
@@ -686,12 +563,9 @@ def _parses_as_timestamp(value) -> bool:
         return False
 
 
-# What "malformed" means, as predicates. Kept alongside the mutators below so
-# a defect can be *detected* as well as applied - tests assert exactly one
-# holds per dirty event, and the run loop counts dirty events without adding a
-# field to EVENT_FIELDS. Deliberately parallel to the reason list in
-# dbt/macros/transaction_validity.sql, which is the warehouse's own copy of
-# this definition.
+# "Malformed" as predicates, kept alongside the mutators below so a defect can
+# be detected as well as applied. Mirrors the reason list in
+# dbt/macros/transaction_validity.sql.
 DIRTY_DEFECT_CHECKS = {
     "NULL_TRANSACTION_ID": lambda e: e["transaction_id"] is None,
     "NULL_CARD_ID": lambda e: e["card_id"] is None,
@@ -720,30 +594,23 @@ def defects(event: dict) -> set[str]:
 
 
 def corrupt_auth(event: dict, rng: random.Random) -> dict:
-    """Return a corrupted *copy* of an AUTH, carrying exactly one defect drawn
-    evenly from DIRTY_DEFECT_MUTATORS. The copy matters: _event_stream yields
-    an auth before scheduling its settlement off the same dict, so corrupting
-    in place would propagate the defect into a settlement that, in a real
-    system, was derived from the authorization the issuer actually approved."""
+    """Return a corrupted *copy* of an AUTH with exactly one defect. Must copy,
+    not mutate in place - _event_stream schedules the settlement off the same
+    dict before this runs."""
     dirty = dict(event)
     DIRTY_DEFECT_MUTATORS[rng.choice(sorted(DIRTY_DEFECT_MUTATORS))](dirty, rng)
     return dirty
 
 
 def _dirty_stream(stream, dirty_rate: float, rng: random.Random | None = None):
-    """Wrap an event stream, corrupting AUTHs at dirty_rate (per AUTH, not per
-    event - SETTLEMENTs are never corrupted).
+    """Wrap an event stream, corrupting AUTHs at dirty_rate (per AUTH;
+    SETTLEMENTs are never corrupted). Draws from its own RNG so --dirty-rate
+    consumes no simulation draws.
 
-    Draws from its own RNG so that enabling --dirty-rate consumes no
-    simulation draws: at a fixed --seed the clean and dirty runs are the same
-    underlying simulation, differing only in the corrupted fields.
-
-    Note the deliberate downstream consequence: an AUTH whose transaction_id
-    is nulled here still has its settlement scheduled against the original id,
-    so that settlement arrives referencing an auth that appears nowhere in the
-    stream and reconciles as ORPHAN_SETTLEMENT. That is faithful - the auth
-    was corrupted on the wire, it did not un-happen - but it means a high
-    --dirty-rate inflates the apparent force-post rate.
+    Note: an AUTH corrupted here still has its settlement scheduled against
+    the original transaction_id, so that settlement arrives referencing an
+    auth nowhere in the stream and reconciles as ORPHAN_SETTLEMENT - a high
+    --dirty-rate therefore inflates the apparent force-post rate.
     """
     rng = rng or random.Random(DIRTY_SEED)
     for event, due_at, kind in stream:
@@ -766,21 +633,17 @@ def _event_stream(cards: list[dict], merchants: list[dict], fraud_rate: float,
                    txns_per_day_per_card: float, settlement_delay_hours: tuple[float, float],
                    start_time: datetime, heap: list[tuple[datetime, int, str, dict]] | None = None):
     """Core simulation loop, shared by Kafka and Parquet modes. Yields
-    (event, synthetic_time, kind) forever, in strict chronological synthetic
-    order - kind is "auth" | "settlement" | "orphan".
+    (event, synthetic_time, kind) forever in strict chronological order -
+    kind is "auth" | "settlement" | "orphan".
 
-    A single min-heap drives everything: each card has its own Poisson
-    arrival process (exponential inter-arrival at txns_per_day_per_card);
-    settlements and orphan force-posts are scheduled onto the SAME heap
-    using each event's own timestamp, so the whole stream - auths,
-    settlements, orphans, across every card - comes out in one strictly
-    ordered synthetic timeline. A card's next turn is never scheduled before
-    its flight gate (next_available_at, see _normal_txn_country) clears, so
-    there's no separate "is this card available" filter needed at pop time.
+    One min-heap drives everything: each card has its own Poisson arrival
+    process, and settlements/orphans get pushed onto the same heap at their
+    own timestamp, so the whole multi-card stream comes out strictly ordered.
+    A card's next turn is never scheduled before its flight gate
+    (next_available_at) clears.
 
-    Pass a `heap` list in if the caller wants to inspect what's still
-    pending after the generator is abandoned mid-stream (e.g. Ctrl+C) - the
-    generator only ever pops/pushes onto it, never drains it on its own.
+    Pass a `heap` list in to inspect what's still pending if the caller
+    abandons the generator mid-stream (e.g. Ctrl+C).
     """
     if heap is None:
         heap = []
@@ -829,10 +692,8 @@ def delivery_report(err, msg):
 
 def _message_key(event: dict) -> bytes | None:
     """Partition key: card_id, for per-card ordering. None for a dirty event
-    whose card_id was nulled - there is no card to order it by, so it takes
-    the default (round-robin) partition assignment rather than crashing the
-    producer or, worse, being silently dropped before the warehouse can
-    quarantine it."""
+    with a nulled card_id, which falls back to round-robin rather than
+    crashing the producer or silently dropping the event."""
     card_id = event["card_id"]
     return card_id.encode() if card_id is not None else None
 
@@ -906,9 +767,7 @@ def run_kafka(args: argparse.Namespace) -> None:
         print(f"\nDone. sent={sent}, fraud={fraud_sent}, settled={settled_sent}, "
               f"orphans={orphan_sent}, dirty={dirty_sent}")
         if interrupted:
-            # No drain on interrupt - a real system stopping doesn't
-            # retroactively settle everything either. This just reports
-            # what was left in flight, on the heap, untouched.
+            # No drain on interrupt - report what's left in flight, untouched.
             pending = sum(1 for entry in heap if entry[2] != "txn")
             gated_cards = sum(1 for c in cards
                                if c["next_available_at"] is not None and c["next_available_at"] > prev_synthetic)
@@ -922,11 +781,9 @@ def generate_events(n: int, cards: list[dict], merchants: list[dict], fraud_rate
                      txns_per_day_per_card: float,
                      settlement_delay_hours: tuple[float, float] = SETTLEMENT_DELAY_HOURS,
                      dirty_rate: float = 0.0) -> list[dict]:
-    """Generate n events via the unified synthetic-clock event stream. The
-    start time is anchored so the run's span (estimated from the aggregate
-    per-card arrival rate) ends near generation wall time - this is a
-    stochastic Poisson process, so the last event lands approximately, not
-    exactly, at "now"."""
+    """Generate n events via the unified synthetic-clock event stream, start
+    time anchored so the run's span ends near generation wall time (a
+    stochastic process, so it lands approximately, not exactly, at "now")."""
     aggregate_rate_per_second = len(cards) * txns_per_day_per_card / 86400
     expected_span_seconds = n / aggregate_rate_per_second
     start_time = datetime.now(timezone.utc) - timedelta(seconds=expected_span_seconds)

@@ -1,17 +1,12 @@
 """Great Expectations batch-quality gate for fraud.gold.
 
-Connects to the Databricks SQL warehouse directly (databricks-sql-connector,
-not GE's own SQL datasource) and runs two small server-side aggregate
-queries against fraud.gold.fct_reconciliation and
-fraud.gold.fct_card_velocity_features, producing exactly seven statistics
-in one row. That row is the batch: one Expectation Suite (seven
-expectations, one per statistic) validated through one Checkpoint against an
-ephemeral (no stores, no Data Docs) context. Aggregating in SQL rather than
-pulling full Gold tables into pandas keeps this cheap enough to run on every
-Airflow DAG run under Free Edition's fair-usage quota.
+Runs two server-side aggregate queries (databricks-sql-connector) against
+fraud.gold.fct_reconciliation and fct_card_velocity_features, producing
+seven statistics in one row. That row is the batch: one Expectation Suite,
+one Checkpoint, ephemeral context (no stores, no Data Docs).
 
-Exit code is the contract this becomes an Airflow gating task on in Week 3:
-0 if every expectation passed, 1 otherwise.
+Exit code is the contract for the Week 3 Airflow gating task: 0 if every
+expectation passed, 1 otherwise.
 """
 
 from __future__ import annotations
@@ -58,10 +53,8 @@ select
 from fraud.gold.fct_card_velocity_features
 """
 
-# (metrics column, human description, expectation). Every check reduces to
-# "is this one column's value between bounds" so one ExpectColumnValuesToBeBetween
-# expectation per statistic covers all seven, including the two count-based
-# checks (row count, recon_status set membership) expressed as == 0 / >= 1.
+# (metrics column, description, expectation). Every check is a bounds check
+# on one column, including the two count-based ones (== 0 / >= 1).
 EXPECTATIONS = [
     (
         "recon_row_count",
