@@ -18,6 +18,8 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+import json
+
 import numpy as np
 import pandas as pd
 import mlflow
@@ -140,7 +142,11 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df["implied_speed_kmh"] = df["implied_speed_kmh"].fillna(ABSENT_SIGNAL_VALUE)
     for col in BOOLEAN_FEATURES:
         df[col] = df[col].astype(int)
-    return df[FEATURES]
+    # astype(float): the warehouse's decimal(12,2) columns arrive as
+    # Decimal objects, which mlflow's NumpyEncoder can't serialize when
+    # log_model writes input_example. Cast once here so the model, the
+    # signature and the example all agree on double.
+    return df[FEATURES].astype(float)
 
 
 # No scaling needed - IsolationForest splits per-feature, scale-invariant.
@@ -425,3 +431,31 @@ for col in scored_sample_df.columns:
 
 spark.createDataFrame(scored_sample_df).write.mode("overwrite").saveAsTable(SCORED_SAMPLE_TABLE)
 print(f"wrote {len(scored_sample_df)} rows ({len(fraud_rows)} fraud, {len(nonfraud_rows)} non-fraud) to {SCORED_SAMPLE_TABLE}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Return value for the caller
+# MAGIC
+# MAGIC A Databricks job run exposes nothing about the MLflow run unless the
+# MAGIC notebook says so explicitly. `dbutils.notebook.exit` is what the
+# MAGIC retrain_model DAG reads (via `jobs.get_run_output`) to print a
+# MAGIC clickable MLflow URL instead of just "the job succeeded". Must stay
+# MAGIC last - `exit` halts the notebook.
+
+# COMMAND ----------
+
+# default=float: metrics carry Decimal (from the warehouse's decimal(12,2)
+# amount) and numpy scalars (from sklearn), neither of which json.dumps
+# handles natively - same hazard the scored-sample cast above guards against.
+dbutils.notebook.exit(
+    json.dumps(
+        {
+            "mlflow_run_id": run.info.run_id,
+            "experiment_id": run.info.experiment_id,
+            "model_version": registered_version.version,
+            "metrics": hybrid_metrics,
+        },
+        default=float,
+    )
+)
