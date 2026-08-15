@@ -1,0 +1,14 @@
+# Build context is the repo root (see docker-compose.yml) so the image can
+# COPY dbt/ and quality/ requirements. Keep everything else out of the context -
+# secrets above all, then the bulky generated dirs that would slow every build.
+.env
+.git
+.venv
+**/__pycache__
+**/*.pyc
+airflow/logs
+airflow/staging
+dbt/target
+dbt/logs
+docs
+notebooks

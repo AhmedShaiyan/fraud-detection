@@ -1,6 +1,56 @@
+x-airflow-common: &airflow-common
+  build:
+    # Repo root, not ./airflow: the image installs dbt and Great Expectations
+    # into their own venvs from dbt/requirements.txt and quality/requirements.txt,
+    # which a ./airflow context couldn't reach.
+    context: .
+    dockerfile: airflow/Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    # Airflow 3 default auth manager (SimpleAuthManager) writes an
+    # auto-generated password to a JSON file inside the container instead of
+    # a normal login - FAB gives back the classic bootstrapped admin/admin
+    # dev login via _AIRFLOW_WWW_USER_* below.
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # Airflow 3's Task Execution API: every task subprocess (even under
+    # LocalExecutor, even in-container) talks to the api-server over HTTP for
+    # its own execution lifecycle, not directly to the DB. Without this,
+    # tasks fail with "Connection refused" against localhost and get SIGKILLed.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Without an explicit shared secret, each container auto-generates its
+    # own random JWT signing key at startup, so a task's auth token (signed
+    # by the scheduler) fails validation at the api-server ("Invalid auth
+    # token") - dev-only fixed value, not a real secret to protect.
+    AIRFLOW__API_AUTH__JWT_SECRET: 5480b2393a6f9d140a06bd0af0edbf75179eca4231d02866802c29dc10674264
+    # from producer import PARQUET_SCHEMA, TOPIC - single-sourced schema
+    # (see /opt/airflow/project mount below), not redefined in the DAG.
+    PYTHONPATH: /opt/airflow/project
+  env_file:
+    - .env
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/staging:/opt/airflow/staging
+    - .:/opt/airflow/project:ro
+    # transform_quality runs dbt and the GE gate in-container. Read-only is
+    # only safe because DBT_TARGET_PATH/DBT_LOG_PATH divert target/, logs/
+    # and partial_parse.msgpack into the staging mount above - see the DBT_ENV
+    # block in dags/transform_quality.py.
+    - ./dbt:/opt/airflow/dbt:ro
+    - ./quality:/opt/airflow/quality:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
 services:
   kafka:
-    image: apache/kafka:3.9.0
+    # 3.9.0 hits KAFKA-18281: KRaft format-time validation incorrectly
+    # rejects the (correctly non-advertised) CONTROLLER listener's 0.0.0.0
+    # bind address. Fixed in 3.9.1+.
+    image: apache/kafka:3.9.2
     container_name: kafka
     ports:
       - "9092:9092"   # host access (your producer/consumer run on the host for now)
@@ -32,7 +82,7 @@ services:
   # One-shot container that creates the topic with an explicit partition count,
   # then exits. 6 partitions keyed by card_id = per-card ordering preserved.
   kafka-init:
-    image: apache/kafka:3.9.0
+    image: apache/kafka:3.9.2
     container_name: kafka-init
     depends_on:
       kafka:
@@ -56,3 +106,93 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-shot: runs the image's built-in entrypoint init logic (db migrate +
+  # admin user create, triggered by the _AIRFLOW_* env vars below) then exits.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin   # dev-only default login, not a secret
+      _AIRFLOW_WWW_USER_FIRSTNAME: Admin
+      _AIRFLOW_WWW_USER_LASTNAME: User
+      _AIRFLOW_WWW_USER_EMAIL: admin@example.com
+      _AIRFLOW_WWW_USER_ROLE: Admin
+    restart: "no"
+
+  # Airflow 3 requires this as a separate service - DAG parsing is no longer
+  # embedded in the scheduler (AIP-43). Without it, DAGs never get registered.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    restart: always
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8081:8080"   # 8080 is Kafka UI
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: always
+
+volumes:
+  postgres-db-volume:

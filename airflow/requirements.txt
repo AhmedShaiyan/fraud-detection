@@ -1,0 +1,17 @@
+# Airflow image extras (CLAUDE.md: pinned requirements.txt per service).
+# apache-airflow itself is pinned by the base image tag in Dockerfile, not here.
+apache-airflow-providers-fab==3.8.0
+confluent-kafka==2.6.1
+# faker: transitively required at import time - the DAG does
+# `from producer import PARQUET_SCHEMA, TOPIC`, which executes producer.py's
+# top-level `from faker import Faker` even though the DAG itself never calls it.
+faker==30.8.2
+databricks-sdk==0.128.0
+databricks-sql-connector==3.6.0
+# databricks-sql-connector 3.6.0 requires pyarrow<17,>=14.0.1 - pinned lower
+# than the root requirements.txt's 18.1.0 for that reason; this image is a
+# separate, independently pinned environment.
+pyarrow==16.1.0
+# dbt and great-expectations are deliberately NOT here - they conflict
+# irreconcilably with databricks-sdk/databricks-sql-connector above and live
+# in separate venvs instead. See the comment in airflow/Dockerfile.
