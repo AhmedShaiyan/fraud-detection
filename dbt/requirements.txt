@@ -2,3 +2,9 @@
 # Installs a compatible dbt-core automatically; verify the latest patch on
 # PyPI if this pin conflicts with another dbt adapter in your environment.
 dbt-databricks==1.9.4
+# dbt-databricks 1.9.4 only declares dbt-core<2.0, so an unpinned install
+# silently picks up whatever core is current - `dbt --version` then reports
+# "at least one plugin is out of date". Pinned to the pairing actually
+# validated against this project (dbt debug + parse + build all clean) so
+# rebuilds are reproducible.
+dbt-core==1.12.2

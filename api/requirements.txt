@@ -1,0 +1,12 @@
+# FastAPI scoring service (CLAUDE.md: pinned requirements.txt per service).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+# mlflow/scikit-learn/pandas mirror notebooks/requirements.txt exactly. These
+# three decide whether the @champion pickle loads at all - unpickling an
+# IsolationForest under a different sklearn build is the training-serving skew
+# this service exists to avoid, so they move together with the notebook or not
+# at all. scikit-learn 1.9.0 requires Python >=3.11 (see Dockerfile).
+mlflow==3.15.1
+scikit-learn==1.9.0
+pandas==2.2.3

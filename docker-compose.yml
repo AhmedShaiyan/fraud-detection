@@ -194,5 +194,30 @@ services:
         condition: service_completed_successfully
     restart: always
 
+  api:
+    build:
+      context: ./api
+    container_name: fraud-api
+    ports:
+      - "8082:8000"   # 8080 Kafka UI, 8081 Airflow
+    env_file:
+      - .env
+    # The scorer never reads Kafka - this is network/startup ordering only, so
+    # the whole local stack comes up in one dependency graph.
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      # /health returns 200 even when the model failed to load (status
+      # "degraded"), so container health tracks "the service is up", not
+      # "Databricks is reachable" - a registry outage shouldn't restart-loop
+      # a working process.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: always
+
 volumes:
   postgres-db-volume:
