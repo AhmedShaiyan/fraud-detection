@@ -1,0 +1,9 @@
+# Streamlit dashboard (CLAUDE.md: pinned requirements.txt per service).
+streamlit==1.41.1
+databricks-sql-connector==3.6.0
+pandas==2.2.3
+# databricks-sql-connector 3.6.0 caps pyarrow at <17 - same constraint as
+# airflow/requirements.txt, pinned explicitly so a rebuild can't drift into it.
+pyarrow==16.1.0
+# altair ships with streamlit; pinned so chart syntax can't shift under us.
+altair==5.5.0

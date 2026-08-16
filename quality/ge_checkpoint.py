@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import great_expectations as gx
@@ -42,6 +43,21 @@ select
     sum(case when recon_status = 'ORPHAN_SETTLEMENT' then 1 else 0 end)
         / nullif(count(*), 0) as orphan_settlement_share
 from fraud.gold.fct_reconciliation
+"""
+
+GATE_RESULTS_TABLE = "fraud.gold.ge_gate_results"
+
+# One row per expectation per run, so the dashboard can show both the current
+# verdict and how quality moved over time.
+CREATE_RESULTS_TABLE_SQL = f"""
+create table if not exists {GATE_RESULTS_TABLE} (
+    checked_at timestamp,
+    expectation string,
+    description string,
+    observed double,
+    passed boolean,
+    overall_success boolean
+)
 """
 
 VELOCITY_METRICS_SQL = """
@@ -106,12 +122,16 @@ EXPECTATIONS = [
 ]
 
 
-def fetch_metrics_row() -> pd.DataFrame:
-    with databricks_sql.connect(
+def _connect():
+    return databricks_sql.connect(
         server_hostname=os.environ["DATABRICKS_HOST"],
         http_path=os.environ["DATABRICKS_HTTP_PATH"],
         access_token=os.environ["DATABRICKS_TOKEN"],
-    ) as conn:
+    )
+
+
+def fetch_metrics_row() -> pd.DataFrame:
+    with _connect() as conn:
         with conn.cursor() as cursor:
             cursor.execute(RECON_METRICS_SQL)
             recon = dict(zip((c[0] for c in cursor.description), cursor.fetchone()))
@@ -148,19 +168,59 @@ def run_checkpoint(metrics_df: pd.DataFrame):
     return checkpoint.run(batch_parameters={"dataframe": metrics_df})
 
 
-def print_summary(checkpoint_result, metrics_df: pd.DataFrame) -> bool:
+def success_by_column(checkpoint_result) -> dict[str, bool]:
     validation_result = next(iter(checkpoint_result.run_results.values()))
-    success_by_column = {
+    return {
         result.expectation_config.kwargs["column"]: result.success
         for result in validation_result.results
     }
 
+
+def print_summary(checkpoint_result, metrics_df: pd.DataFrame) -> bool:
+    passed = success_by_column(checkpoint_result)
+
     row = metrics_df.iloc[0]
     for column, description, _ in EXPECTATIONS:
-        status = "PASS" if success_by_column.get(column) else "FAIL"
+        status = "PASS" if passed.get(column) else "FAIL"
         print(f"[{status}] {description} (observed={row[column]!r})")
 
     return bool(checkpoint_result.success)
+
+
+def record_results(checkpoint_result, metrics_df: pd.DataFrame, success: bool) -> None:
+    """Append this run's verdict to fraud.gold.ge_gate_results.
+
+    Without this the gate's result exists only as an exit code that Airflow
+    consumes and discards - the dashboard has nothing to read and there's no
+    history of when quality drifted. Self-bootstrapping (no dbt model), same
+    precedent as the notebook-managed isolation_forest_scored_sample.
+    """
+    passed = success_by_column(checkpoint_result)
+    row = metrics_df.iloc[0]
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    values = []
+    for column, description, _ in EXPECTATIONS:
+        observed = row[column]
+        values.append([
+            checked_at,
+            column,
+            description,
+            None if pd.isna(observed) else float(observed),
+            bool(passed.get(column)),
+            success,
+        ])
+
+    placeholders = ", ".join(["(cast(? as timestamp), ?, ?, ?, ?, ?)"] * len(values))
+    with _connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(CREATE_RESULTS_TABLE_SQL)
+            cursor.execute(
+                f"insert into {GATE_RESULTS_TABLE} "
+                "(checked_at, expectation, description, observed, passed, overall_success) "
+                f"values {placeholders}",
+                [v for value_row in values for v in value_row],
+            )
 
 
 def main() -> int:
@@ -168,6 +228,15 @@ def main() -> int:
     metrics_df = fetch_metrics_row()
     checkpoint_result = run_checkpoint(metrics_df)
     success = print_summary(checkpoint_result, metrics_df)
+
+    # Never let a logging failure change the verdict - the exit code is the
+    # Airflow gating contract, and a warehouse hiccup while recording history
+    # must not turn a passing batch into a failed task.
+    try:
+        record_results(checkpoint_result, metrics_df, success)
+    except Exception as exc:
+        print(f"[WARN] could not record results to {GATE_RESULTS_TABLE}: {exc}")
+
     return 0 if success else 1
 
 

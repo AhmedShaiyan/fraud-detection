@@ -219,5 +219,26 @@ services:
       start_period: 40s
     restart: always
 
+  dashboard:
+    build:
+      # Repo root, not ./dashboard: the image copies api/scoring.py so the
+      # rule thresholds stay single-sourced across notebook, API and dashboard.
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: fraud-dashboard
+    ports:
+      - "8083:8501"   # 8080 Kafka UI, 8081 Airflow, 8082 API
+    env_file:
+      - .env
+    # No depends_on: it reads the SQL warehouse only. Coupling it to Kafka
+    # would be decoration, not a real dependency.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
 volumes:
   postgres-db-volume:

@@ -1,0 +1,12 @@
+# Copied to ~/.streamlit/config.toml in the image.
+[theme]
+# Pinned light: the chart palette was validated for contrast and colour-vision
+# separation against a white surface. Letting the theme follow the viewer's OS
+# would render those checks meaningless.
+base = "light"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
