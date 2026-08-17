@@ -62,7 +62,7 @@ def _numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return out
 
 
-# --- sidebar ----------------------------------------------------------------
+# sidebar
 
 with st.sidebar:
     st.header("Controls")
@@ -94,7 +94,7 @@ except Exception as exc:
     st.stop()
 
 
-# --- panel 1: reconciliation ------------------------------------------------
+# panel 1: reconciliation
 
 st.header("1 - Reconciliation status")
 
@@ -134,7 +134,7 @@ else:
     st.altair_chart(chart, use_container_width=True)
 
 
-# --- panel 2: detection performance -----------------------------------------
+# panel 2: detection performance
 
 st.header("2 - Fraud detection performance")
 
@@ -211,7 +211,7 @@ else:
     )
 
 
-# --- panel 3: recent flagged ------------------------------------------------
+# panel 3: recent flagged
 
 st.header("3 - Recent flagged transactions")
 
@@ -249,7 +249,7 @@ else:
     )
 
 
-# --- panel 4: volume and quality --------------------------------------------
+# panel 4: volume and quality
 
 st.header("4 - Volume and quality")
 

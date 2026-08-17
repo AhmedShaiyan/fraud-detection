@@ -1,27 +1,15 @@
 """Bridge Kafka `transactions` -> Volume -> Bronze, every 15 minutes.
 
-consume_batch reads only messages timestamped in
-[data_interval_start, data_interval_end) via offsets_for_times (never
-"whatever's there", never datetime.now()); upload_to_volume lands the
-Parquet in the UC volume; run_copy_into loads it into
-fraud.bronze.transactions_raw.
+consume_batch bounds the read to [data_interval_start, data_interval_end)
+via offsets_for_times; upload_to_volume lands the Parquet in the UC volume;
+run_copy_into loads it into fraud.bronze.transactions_raw.
 
-Re-running the same interval converges to the same warehouse state, not
-duplicate rows, via three layers:
-  1. Timestamp-bounded read - the topic is append-only (48h retention), so
-     the same interval always resolves to the same offset range once those
-     messages exist.
-  2. Deterministic filename + overwrite=True - a retried upload replaces the
-     same Volume object instead of creating a second file.
-  3. COPY INTO's own file-tracking - a retried load of a file path Bronze
-     already ingested is a no-op.
+Retry-safe: bounded read always resolves the same offsets, upload overwrites
+the same deterministic filename, and COPY INTO dedupes by file path.
 
-Caveat: COPY INTO tracks by file path, not content. If messages with
-in-window timestamps are produced after task 1's first successful read but
-before a retry, the retry's larger Parquet overwrites the Volume object but
-COPY INTO still skips it as already-loaded - late-arriving in-window data
-past the first successful load of an interval isn't picked up. A grace-period
-watermark would fix this; out of scope here.
+Caveat: COPY INTO tracks file path, not content, so in-window messages
+produced after a retry's upload aren't picked up (no grace-period watermark
+yet).
 """
 
 from __future__ import annotations
@@ -46,9 +34,8 @@ STAGING_DIR = Path("/opt/airflow/staging")
 VOLUME_DIR = "/Volumes/fraud/bronze/landing"
 POLL_IDLE_TIMEOUT_SECONDS = 30  # guards against hanging if Kafka stalls mid-read
 
-# Standing statement: scans the whole landing dir every run and relies
-# entirely on COPY INTO's own file-tracking for idempotency (layer 3 above),
-# not on being told which file just landed.
+# Scans the whole landing dir every run; COPY INTO's own file-tracking
+# handles idempotency.
 COPY_INTO_SQL = f"""
 COPY INTO fraud.bronze.transactions_raw
 FROM (
@@ -82,10 +69,7 @@ def _bounded_offsets(consumer: Consumer, partitions: list[int], ts: datetime) ->
 
 @dag(
     dag_id="ingest_transactions",
-    # A plain cron string defaults to CronTriggerTimetable in Airflow 3
-    # (data_interval_start == data_interval_end, no real window) - explicit
-    # CronDataIntervalTimetable is what actually gives consume_batch a real
-    # [start, end) to bound Kafka offsets against.
+    # plain cron would default to CronTriggerTimetable (start == end, no window)
     schedule=CronDataIntervalTimetable("*/15 * * * *", timezone="UTC"),
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     catchup=False,
@@ -153,10 +137,8 @@ def ingest_transactions():
             WorkspaceClient().files.upload(file_path=volume_path, contents=f, overwrite=True)
         return volume_path
 
-    # outlets: success here is what triggers transform_quality. Emitting on
-    # this task (not the DAG) means the asset updates only once Bronze
-    # actually has the rows - and an empty-window skip propagates down the
-    # chain, so no update fires and no pointless dbt build runs.
+    # outlet on this task, not the DAG - an empty-window skip upstream means
+    # this never runs, so no pointless dbt build fires downstream.
     @task(
         retries=2,
         retry_delay=timedelta(seconds=30),

@@ -1,5 +1,5 @@
 # Docs and markdown (internal planning notes, not for the public repo)
-*.md
+
 docs/
 
 # Secrets

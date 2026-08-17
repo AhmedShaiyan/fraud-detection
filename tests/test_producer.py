@@ -418,7 +418,7 @@ def test_parquet_schema_matches_kafka_json_schema(cards, merchants, tmp_path):
     assert table.num_rows == 50
 
 
-# --- Entity stability across runs ---------------------------------------------
+# Entity stability across runs
 
 def _population(sim_seed: int, n_cards: int = 25, n_merchants: int = 25):
     """One 'producer run' at a given --seed, with drift off so the comparison
@@ -482,7 +482,7 @@ def test_entity_ids_are_unique_within_pool():
     assert len({m["merchant_id"] for m in merchants}) == 300
 
 
-# --- Dirty-data injection ------------------------------------------------------
+# Dirty-data injection
 
 def test_dirty_rate_matches_requested(cards, merchants):
     requested = 0.10
@@ -572,7 +572,7 @@ def test_message_key_survives_null_card_id():
     assert p._message_key({"card_id": None}) is None
 
 
-# --- Merchant drift ------------------------------------------------------------
+# Merchant drift
 
 def test_merchant_drift_rate_approx_2_percent():
     drifted = total = 0

@@ -25,7 +25,7 @@ def _query(conn, sql: str) -> pd.DataFrame:
         return pd.DataFrame(cursor.fetchall(), columns=columns)
 
 
-# --- panel 1: reconciliation ------------------------------------------------
+# panel 1: reconciliation
 
 RECON_DISTRIBUTION_SQL = """
 select recon_status, is_break, is_matured, count(*) as n
@@ -39,7 +39,7 @@ def recon_distribution(conn) -> pd.DataFrame:
     return _query(conn, RECON_DISTRIBUTION_SQL)
 
 
-# --- panel 2: detection performance -----------------------------------------
+# panel 2: detection performance
 
 # Recall per fraud_type for each of the three strategies. Every holdout fraud
 # row is in the sample, so these reproduce the notebook's figures exactly.
@@ -102,7 +102,7 @@ def overall_metrics(conn) -> pd.DataFrame:
     return df[["strategy", "precision", "recall", "fpr", "true_positives", "false_positives"]]
 
 
-# --- panel 3: recent flagged ------------------------------------------------
+# panel 3: recent flagged
 
 
 def _rule_columns_sql() -> str:
@@ -137,7 +137,7 @@ def recent_flagged(conn, limit: int = 50) -> pd.DataFrame:
     return _query(conn, recent_flagged_sql(limit))
 
 
-# --- panel 4: volume and quality --------------------------------------------
+# panel 4: volume and quality
 
 # Silver rather than bronze: deduped, so counts reflect distinct events.
 DAILY_VOLUME_SQL = """

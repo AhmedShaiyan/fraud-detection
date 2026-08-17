@@ -5,20 +5,19 @@
   )
 }}
 
--- Bronze rows that fail any check in macros/transaction_validity.sql, held
--- rather than dropped. slv_authorizations/slv_settlements take the exact
--- complement (same macro, negated), so every Bronze row lands in exactly one
--- of the three (see tests/assert_no_bronze_rows_dropped.sql,
+-- Bronze rows that fail macros/transaction_validity.sql, held rather than
+-- dropped. slv_authorizations/slv_settlements take the exact complement, so
+-- every Bronze row lands in exactly one of the three (see
+-- tests/assert_no_bronze_rows_dropped.sql,
 -- tests/assert_quarantine_disjoint_from_silver.sql).
 --
--- Values kept RAW (no timestamp/decimal casts) so the evidence isn't
--- destroyed by casting - except card_id, still hashed like Silver.
+-- Values kept RAW (no casts) so the evidence isn't destroyed - except
+-- card_id, still hashed like Silver.
 --
 -- unique_key is quarantine_key, not transaction_id: null transaction_id is
--- itself a quarantine reason, and a merge on a null key never matches. The
--- surrogate hashes identifying columns + _source_file for idempotent
--- re-processing. merge_exclude_columns keeps quarantined_at at its original
--- value on re-seen rows ("when this first failed", not "when dbt last ran").
+-- itself a quarantine reason, and a merge on a null key never matches.
+-- merge_exclude_columns keeps quarantined_at at first-failure time, not
+-- last dbt run.
 
 with source as (
 

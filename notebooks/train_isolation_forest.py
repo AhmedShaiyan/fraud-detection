@@ -57,15 +57,12 @@ FEATURES = [
     "has_history",
 ]
 
-# Deterministic rules layered on top of the model (hybrid scoring). Same
-# contract role as FEATURES - FastAPI replicates these thresholds directly
-# in Week 4. `df[column] > threshold` is False for a null column value in
-# pandas, so GEO_RULE/AMOUNT_RULE skip null rows with no extra guarding.
+# Hybrid scoring: rules layered on the model, thresholds FastAPI replicates
+# in Week 4. `df[column] > threshold` is False on null, so GEO_RULE/
+# AMOUNT_RULE skip nulls with no extra guarding.
 #
 # VELOCITY_RULE at > 2, not > 5: txn_count_1h excludes self, so a 5-event
-# burst peaks at count 4 and never reaches > 5 - that threshold missed short
-# bursts entirely. > 2 catches burst rows from the 3rd event onward, well
-# above the normal per-card baseline (~0.16).
+# burst peaks at 4 and never reaches > 5.
 RULES = {
     "VELOCITY_RULE": {"column": "txn_count_1h", "threshold": 2},
     "GEO_RULE": {"column": "implied_speed_kmh", "threshold": 1500},
@@ -109,19 +106,16 @@ print(f"holdout: {len(holdout_df)} rows, {holdout_df['is_fraud'].mean():.4f} fra
 # MAGIC %md
 # MAGIC ## Imputation
 # MAGIC
-# MAGIC Every null traces to a card's first transaction (`has_history = false`) or,
-# MAGIC for `implied_speed_kmh`, a CNP row / no prior card-present event.
+# MAGIC Nulls trace to a card's first transaction (`has_history = false`) or, for
+# MAGIC `implied_speed_kmh`, a CNP row / no prior card-present event. Medians
+# MAGIC computed on the train split only, reused for holdout.
 # MAGIC
-# MAGIC - `amount_avg_24h`, `minutes_since_last_txn`: train-split **median**, not a
-# MAGIC   sentinel - an extreme value would make "new card" itself the anomaly
-# MAGIC   signal, when `has_history` already covers that honestly.
-# MAGIC - `amount_vs_avg_24h_ratio`: `1.0` (neutral - "same as itself").
-# MAGIC - `implied_speed_kmh`: `0.0`, not median - null means "no signal," and the
-# MAGIC   median would fabricate a plausible speed for rows that can't have one.
-# MAGIC - `txn_count_1h/24h`, `amount_sum_24h`, `distinct_countries_24h`: never
-# MAGIC   null, no imputation needed.
-# MAGIC
-# MAGIC Medians computed on the train split only, reused for holdout (no leakage).
+# MAGIC - `amount_avg_24h`, `minutes_since_last_txn`: median (a sentinel would
+# MAGIC   make "new card" itself the anomaly signal, when `has_history` already
+# MAGIC   covers that)
+# MAGIC - `amount_vs_avg_24h_ratio`: `1.0` (neutral)
+# MAGIC - `implied_speed_kmh`: `0.0` - null means "no signal," not "no speed"
+# MAGIC - `txn_count_1h/24h`, `amount_sum_24h`, `distinct_countries_24h`: never null
 
 # COMMAND ----------
 

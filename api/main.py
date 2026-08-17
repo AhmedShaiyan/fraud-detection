@@ -1,18 +1,15 @@
 """FastAPI scoring service for the @champion Isolation Forest.
 
-Serves the same hybrid verdict the training notebook computes offline: the
-model's anomaly score plus the three deterministic rules, OR-ed together.
+Serves the same hybrid verdict the training notebook computes offline: model
+anomaly score OR-ed with the three deterministic rules.
 
-Loads mlflow.sklearn rather than mlflow.pyfunc on purpose. The response
-carries anomaly_score, which the notebook defines as -score_samples(X); the
-pyfunc flavour of an sklearn model exposes only predict() (1/-1), so
-score_samples is unreachable through it. The sklearn flavour hands back the
-real IsolationForest and gives both.
+Loads mlflow.sklearn, not mlflow.pyfunc: pyfunc only exposes predict()
+(1/-1), and anomaly_score needs score_samples(), which only the sklearn
+flavour hands back.
 
-A registry failure at startup is recorded, not raised: `docker compose up`
-has to bring every local service up healthy (CLAUDE.md), so the container
-comes up and reports itself degraded instead of crash-looping and making the
-whole stack look broken.
+A registry failure at startup is recorded, not raised, so the container
+comes up degraded instead of crash-looping - `docker compose up` must bring
+every local service up healthy.
 """
 
 from __future__ import annotations

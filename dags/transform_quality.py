@@ -1,25 +1,15 @@
 """Bronze -> Silver -> Gold via dbt, gated by Great Expectations.
 
-Runs when ingest_transactions updates fraud.bronze.transactions_raw - not on
-its own cron. Two independent 15-minute schedules would eventually let this
-DAG fire mid-ingest and rebuild Gold from a half-loaded Bronze, and it would
-do so *silently*: dbt succeeds happily on stale data, so the failure mode is
-wrong numbers, not a red task. The asset dependency makes ingest-before-
-transform something the scheduler enforces rather than something the two
-cron expressions happen to agree on.
+Triggered by ingest_transactions updating fraud.bronze.transactions_raw, not
+its own cron - avoids rebuilding Gold mid-ingest from a half-loaded Bronze
+(dbt succeeds silently on stale data, so that failure mode is wrong numbers,
+not a red task).
 
-Task order and why the snapshot is separated from the build:
-  1. run_dbt_build   - models + tests, snapshots excluded.
-  2. run_ge_gate     - aggregate expectations over Gold; nonzero exit fails.
-  3. run_dbt_snapshot - merchant SCD2, only reached if the gate passed.
-
-`dbt build` normally includes snapshots, which would run them in step 1,
-ungated. They're excluded there and run last because every other model here
-is an idempotent rebuild while a snapshot is an irreversible append to SCD2
-history: a bad batch in fraud.gold.* is fixed by re-running dbt, but a bad
-batch written into merchants_snapshot corrupts dbt_valid_from/dbt_valid_to
-in a way no re-run undoes. The non-idempotent step is the one that waits
-behind the quality gate.
+Steps: run_dbt_build (models + tests, snapshots excluded) -> run_ge_gate
+(nonzero exit fails) -> run_dbt_snapshot (merchant SCD2). Snapshot runs last
+and only on success because it's an irreversible append - a bad batch
+corrupts dbt_valid_from/to in a way no re-run undoes, unlike the idempotent
+build.
 """
 
 from __future__ import annotations
@@ -33,19 +23,14 @@ from airflow.providers.standard.operators.bash import BashOperator
 from assets import BRONZE_TRANSACTIONS_RAW
 
 DBT_DIR = "/opt/airflow/dbt"
-# Own venvs, not Airflow's - their pins conflict irreconcilably with the
-# databricks-sdk/-sql-connector versions the ingest DAG needs. See
-# airflow/Dockerfile.
+# Own venvs, not Airflow's - pins conflict with databricks-sdk/-sql-connector
+# versions the ingest DAG needs. See airflow/Dockerfile.
 DBT_BIN = "/opt/dbt-venv/bin/dbt"
 GE_PYTHON = "/opt/ge-venv/bin/python"
 
-# The repo is mounted read-only, so dbt's three write paths are redirected
-# into the writable staging mount: target/ + partial_parse.msgpack via
-# DBT_TARGET_PATH, logs/ via DBT_LOG_PATH, and .user.yml (written to the
-# profiles dir on first run) suppressed by turning off anonymous stats.
-# BashOperator(env=...) replaces the child environment wholesale, so the
-# Databricks vars profiles.yml resolves via env_var() are passed through
-# explicitly rather than inherited.
+# Repo is read-only, so dbt's writable paths are redirected into the staging
+# mount. BashOperator(env=...) replaces the child env wholesale, so the
+# Databricks vars profiles.yml needs via env_var() are passed explicitly.
 DBT_ENV = {
     "PATH": os.environ["PATH"],
     "HOME": os.environ.get("HOME", "/home/airflow"),
@@ -62,8 +47,8 @@ DBT_ENV = {
     dag_id="transform_quality",
     schedule=[BRONZE_TRANSACTIONS_RAW],
     catchup=False,
-    # dbt build + GE against serverless outlasts the 15-minute ingest cadence
-    # under backfill; queue the next run instead of stacking warehouse load.
+    # under backfill, dbt+GE can outlast the 15-min ingest cadence; queue
+    # rather than stack warehouse load.
     max_active_runs=1,
     default_args={"retries": 0},
     tags=["transform", "quality", "dbt"],
@@ -72,14 +57,13 @@ DBT_ENV = {
 def transform_quality():
     run_dbt_build = BashOperator(
         task_id="run_dbt_build",
-        # --exclude-resource-type snapshot: see module docstring.
+        # snapshot excluded: see module docstring
         bash_command=(
             f"{DBT_BIN} build --project-dir {DBT_DIR} --profiles-dir {DBT_DIR} "
             "--exclude-resource-type snapshot"
         ),
         env=DBT_ENV,
-        # The only network-crossing task worth retrying - a dropped warehouse
-        # connection is transient in a way the other two aren't.
+        # only network-crossing task worth retrying on a dropped connection
         retries=2,
         retry_delay=timedelta(seconds=30),
         retry_exponential_backoff=True,
@@ -87,15 +71,13 @@ def transform_quality():
 
     run_ge_gate = BashOperator(
         task_id="run_ge_gate",
-        # Exit code is the gate's documented contract: 0 all-pass, 1 otherwise.
+        # exit code contract: 0 all-pass, 1 otherwise
         bash_command=f"{GE_PYTHON} /opt/airflow/quality/ge_checkpoint.py",
-        # No retries by design. A failed expectation is a verdict about the
-        # data, not a flaky call; retrying re-asks a question already answered.
+        # no retries: a failed expectation is a verdict, not a flaky call
         retries=0,
     )
 
-    # Default trigger_rule (all_success) is exactly "only if the gate passed" -
-    # a failed gate leaves this upstream_failed, so no SCD2 rows are appended.
+    # default trigger_rule (all_success): a failed gate skips this, no SCD2 append
     run_dbt_snapshot = BashOperator(
         task_id="run_dbt_snapshot",
         bash_command=f"{DBT_BIN} snapshot --project-dir {DBT_DIR} --profiles-dir {DBT_DIR}",

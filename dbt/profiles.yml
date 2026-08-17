@@ -1,6 +1,4 @@
-# Checked into the repo deliberately: no secrets live here, only env var
-# references (CLAUDE.md: secrets ONLY via .env, never hardcoded). Point dbt
-# at this file with --profiles-dir dbt (see run.ps1) instead of ~/.dbt/.
+
 fraud_detection:
   target: dev
   outputs:

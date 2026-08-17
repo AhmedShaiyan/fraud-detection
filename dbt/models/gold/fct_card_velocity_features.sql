@@ -1,30 +1,20 @@
 {{ config(materialized='table') }}
 
--- Full rebuild every run: window aggregates depend on a card's entire
--- ordered history, and a late/out-of-order backfilled auth would otherwise
--- leave downstream rows stale under incremental. At production scale, use a
--- bounded lookback window per card_id_hash instead (same tradeoff as
--- fct_reconciliation).
+-- Full rebuild every run: window aggregates need a card's full ordered
+-- history; incremental would leave rows stale after a late/backfilled auth.
+-- Bounded lookback per card_id_hash would fix this at scale.
 --
--- Training-serving parity: this is the offline training feature source
--- only. A real-time scorer needs its own live feature cache or point-in-time
--- recomputation - training here and serving off a differently-computed
--- store is a skew risk to resolve explicitly at serving time.
+-- Training-serving parity: offline feature source only - a real-time scorer
+-- needs its own live cache or point-in-time recompute.
 --
--- Same-second ties: RANGE frames ending at CURRENT ROW treat same-second
--- peers as visible to each other, so txn_count_1h/24h/amount_sum_24h/
--- has_history (inclusive RANGE minus self) see same-second peers as
--- history. distinct_countries_24h and the LAG-based recency features stop
--- strictly before the current row instead, so same-second peers are
--- invisible there. has_history uses the RANGE-count technique (not a LAG
--- NULL check) so it stays consistent with txn_count_1h/24h under ties.
+-- Same-second ties: RANGE-frame features (txn_count_1h/24h, amount_sum_24h,
+-- has_history) see same-second peers as history; distinct_countries_24h and
+-- the LAG-based recency features don't. has_history uses the RANGE-count
+-- technique, not a LAG NULL check, to stay consistent with the counts.
 --
--- implied_speed_kmh is null for card-not-present rows (merchant coords
--- don't locate a CNP cardholder) and is computed against the nearest prior
--- card-present row via `lag ... ignore nulls`, not the immediately
--- preceding row. A legitimate transaction right after a fraudulent one
--- inherits an anomalous speed (the fraud moved the card, not the
--- cardholder) - a realistic false positive, kept deliberately (see
+-- implied_speed_kmh: null for card-not-present rows, computed against the
+-- nearest prior card-present row via `lag ... ignore nulls`. A legit txn
+-- right after fraud inherits an anomalous speed by design (see
 -- tests/assert_normal_implied_speed_within_ceiling.sql).
 
 with auths as (

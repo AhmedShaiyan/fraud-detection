@@ -1,5 +1,5 @@
-# Airflow image extras (CLAUDE.md: pinned requirements.txt per service).
-# apache-airflow itself is pinned by the base image tag in Dockerfile, not here.
+# Airflow image extras. apache-airflow itself is pinned by the base image
+# tag in Dockerfile, not here.
 apache-airflow-providers-fab==3.8.0
 confluent-kafka==2.6.1
 # faker: transitively required at import time - the DAG does

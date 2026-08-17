@@ -34,7 +34,7 @@ def _notebook_literal(name: str):
     raise AssertionError(f"{name} not found at module level in {NOTEBOOK}")
 
 
-# --- training-serving parity ------------------------------------------------
+# training-serving parity
 
 
 def test_features_match_notebook():
@@ -61,7 +61,7 @@ def test_every_rule_has_a_response_name():
     assert set(scoring.RULE_RESPONSE_NAMES) == set(scoring.RULES)
 
 
-# --- rule boundaries --------------------------------------------------------
+# rule boundaries
 
 CLEAN = {
     "amount": 10.0,
@@ -108,7 +108,7 @@ def test_rules_are_independent():
     assert _flags(implied_speed_kmh=9000) == {"velocity": False, "geo": True, "amount": False}
 
 
-# --- frame construction -----------------------------------------------------
+# frame construction
 
 
 def test_frame_column_order_matches_features():
@@ -129,7 +129,7 @@ def test_frame_ignores_extra_keys():
     assert "card_id_hash" not in frame.columns
 
 
-# --- combined_flag composition ----------------------------------------------
+# combined_flag composition
 
 
 def test_combined_flag_fires_on_rule_alone():

@@ -60,7 +60,7 @@ from faker import Faker
 TOPIC = "transactions"
 BOOTSTRAP = "localhost:9092"
 
-# --- Random streams (see module docstring) --------------------------------------
+# Random streams (see module docstring)
 
 ENTITY_SEED = 42     # card/merchant master population; never varies
 DIRTY_SEED = 1337    # which AUTHs get corrupted, and how
@@ -82,7 +82,7 @@ def seed_simulation(seed: int | None = None) -> None:
     _SIM.seed(seed)
 
 
-# --- Simulation tuning ----------------------------------------------------------
+# Simulation tuning
 
 NEVER_SETTLE_RATE = 0.05       # of approved auths, fraction that never settle
 ORPHAN_SETTLEMENT_RATE = 0.005 # independent chance per auth of an orphan settlement
@@ -106,7 +106,7 @@ GROUND_SPEED_KMH = 80          # ground travel speed ceiling for same-country ca
 
 MERCHANT_DRIFT_RATE = 0.02     # per run, chance a merchant's name or mcc mutates
 
-# --- Reference data -----------------------------------------------------------
+# Reference data
 
 # Merchant Category Codes (real MCC values; finance vocab, learn these)
 MCC = {
@@ -265,7 +265,7 @@ def _apply_merchant_drift(merchants: list[dict], drift_rate: float,
     return drifted
 
 
-# --- Transaction generation ---------------------------------------------------
+# Transaction generation
 
 def derive_entry_fields(channel: str) -> tuple[str, bool]:
     """POS entry mode + card-present flag, derived from channel."""
@@ -466,7 +466,7 @@ def generate_auth_batch(card: dict, merchants: list[dict], fraud_rate: float,
     return normal_txn(card, merchants, ts)
 
 
-# --- Settlement generation ------------------------------------------------------
+# Settlement generation
 
 def settlement_drift(auth: dict) -> float:
     """Fractional diff between settled and authorized amount, drawn from a
@@ -545,7 +545,7 @@ def orphan_settlement(cards: list[dict], merchants: list[dict], ts: datetime | N
     return settlement
 
 
-# --- Data-quality defect injection ------------------------------------------------
+# Data-quality defect injection
 
 # Looks like a timestamp but parses as neither ISO-8601 in Python nor a Spark
 # timestamp (month 13, day 45, hour 99) - `cast(event_time as timestamp)`
@@ -620,7 +620,7 @@ def _dirty_stream(stream, dirty_rate: float, rng: random.Random | None = None):
             yield event, due_at, kind
 
 
-# --- Unified event-driven scheduling --------------------------------------------
+# Unified event-driven scheduling
 
 def _sample_interarrival_seconds(txns_per_day_per_card: float) -> float:
     """Exponential inter-arrival time for a Poisson arrival process at the
@@ -683,7 +683,7 @@ def _event_stream(cards: list[dict], merchants: list[dict], fraud_rate: float,
         heapq.heappush(heap, (next_due, next(seq), "txn", card))
 
 
-# --- Kafka plumbing -----------------------------------------------------------
+# Kafka plumbing
 
 def delivery_report(err, msg):
     if err is not None:
@@ -775,7 +775,7 @@ def run_kafka(args: argparse.Namespace) -> None:
                   f"pending on the heap, {gated_cards} cards currently flight-gated.")
 
 
-# --- Parquet bridge-test mode ---------------------------------------------------
+# Parquet bridge-test mode
 
 def generate_events(n: int, cards: list[dict], merchants: list[dict], fraud_rate: float,
                      txns_per_day_per_card: float,
