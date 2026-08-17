@@ -95,11 +95,7 @@ async def lifespan(app: FastAPI):
     app.state.loaded_at = None
     app.state.load_error = None
 
-    # Loaded off the startup path on purpose. An unreachable DATABRICKS_HOST
-    # makes the SDK's host-metadata lookup block for a full 5 minutes; doing
-    # that inside lifespan means uvicorn never finishes starting, so the
-    # service answers nothing at all instead of answering "degraded". A daemon
-    # thread lets /health respond immediately and report the real state.
+    #
     threading.Thread(target=_load_in_background, args=(app,), daemon=True).start()
 
     yield
