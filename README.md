@@ -27,13 +27,6 @@ This pipeline simulates how banks catch fraudulent card transactions in real tim
 - **Serving:** FastAPI 0.115.6, Pydantic 2.10.4, Streamlit 1.41.1
 - **Infrastructure:** Docker Compose, Postgres 16 (Airflow metadata), Databricks SDK / SQL connector
 
-## Key design decisions
-
-**Three-layer ingest idempotency.** Three things make re-running the same interval safe. `consume_batch` bounds each Kafka read to `[data_interval_start, data_interval_end)` via `offsets_for_times`, so a retry always resolves the same offset range. `upload_to_volume` writes a deterministic filename with `overwrite=True`, so a retry replaces the file instead of duplicating it. `COPY INTO` tracks loaded file paths on its own. Re-running the same interval converges to the same Bronze state instead of piling up duplicate rows.
-
-**GE gate protecting the non-idempotent snapshot.** `transform_quality` runs `dbt build` first (models and tests, snapshot excluded), then a Great Expectations checkpoint against Gold, then `dbt snapshot` last. The snapshot only runs if the checkpoint passes. Every other model here is an idempotent rebuild. The merchant SCD2 snapshot is not. It's an irreversible append, so it's the one step held behind quality gating.
-
-**Hybrid rules + model scoring.** Three deterministic threshold rules (velocity, geo, amount) run alongside the Isolation Forest, OR-ed into one verdict. The rules catch most fraud outright, cheaply. The model picks up multivariate cases that fall under a rule's threshold. See [Model performance](#model-performance) for the recall breakdown this produces.
 
 ## Setup and run
 
@@ -94,10 +87,3 @@ Numbers below come from holdout evaluation. They compare the Isolation Forest al
 
 Hybrid recall matches rules-only on geo_impossible and amount_anomaly. The model doesn't add anything there. On velocity it does better, 0.642 versus 0.623 for rules alone. That's because the model catches burst rows before `txn_count_1h` crosses the rule's threshold. It's the entire source of hybrid's overall recall gain, from 0.612 up to 0.624. The cost is precision, which drops from 0.867 to 0.646 as the model adds its own false positives.
 
-## Known limitations and future work
-
-- Imputation medians (`amount_avg_24h`, `minutes_since_last_txn`) get recomputed on every training run. They're never logged as MLflow params or artifacts, so you can't reproduce a served `@champion`'s exact imputation values from the registry alone.
-- `recon_amount_tolerance_pct` is one flat rate (10%) across all MCCs. Real card networks vary drift tolerance by MCC. Restaurants and hospitality tolerate more tip-driven drift than retail does.
-- Promotion beyond first registration is manual. A human moves `@champion` in the MLflow UI. There's no regression-gated automatic promotion against the incumbent's holdout metrics.
-- FastAPI scores each request against Gold-computed velocity features, with no live feature cache. A real-time deployment would need an online feature store instead of point-in-time reads off a batch table.
-- Settlement-drift or MCC-tolerance changes need a full producer data reset. History generated before the three-way drift mixture was introduced isn't retroactively consistent with it.
