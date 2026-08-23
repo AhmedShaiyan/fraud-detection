@@ -1,89 +1,82 @@
-# Real-Time Fraud Detection Pipeline
+# Fraud Detection
 
-## Project overview
+An end-to-end fraud detection pipeline covering data ingestion, transformation, validation, model training, and prediction serving.
 
-This pipeline simulates how banks catch fraudulent card transactions in real time. It generates realistic transactions with a full payment lifecycle. Each purchase is authorized right away, then usually settles for payment hours or days later. That data flows through the kind of system a real payments company would run. There's a streaming layer, a data lakehouse, automated quality checks, and a machine learning model that flags anything suspicious. It's built on Kafka, Airflow, Databricks (Unity Catalog, Delta Lake), dbt, Great Expectations, an Isolation Forest model tracked with MLflow, and a FastAPI plus Streamlit front end.
+## Table of Contents
+
+- [Fraud Detection](#fraud-detection)
+  - [Table of Contents](#table-of-contents)
+  - [Project Overview](#project-overview)
+  - [Technologies Used](#technologies-used)
+  - [Features](#features)
+    - [Data Pipeline](#data-pipeline)
+    - [Data Quality](#data-quality)
+    - [Machine Learning](#machine-learning)
+    - [Model Serving](#model-serving)
+  - [Project Structure](#project-structure)
+
+## Project Overview
+
+The project implements a data pipeline for detecting fraudulent transactions. It combines data engineering, machine learning, and model serving components.
+
+The pipeline includes:
+
+- Kafka for data ingestion
+- Airflow for workflow orchestration
+- Databricks for data processing
+- dbt for data transformation
+- Great Expectations for data validation
+- MLflow for experiment tracking
+- FastAPI for model serving
+- Streamlit for visualization
+
+## Technologies Used
+
+- **Python**
+- **Kafka**
+- **Apache Airflow**
+- **Databricks**
+- **dbt**
+- **Great Expectations**
+- **MLflow**
+- **FastAPI**
+- **Streamlit**
 
 ## Features
 
-- Simulates realistic card transaction traffic through Kafka. That includes authorizations, their later settlements, and three injected fraud patterns (rapid bursts, geographically impossible transaction pairs, abnormal amounts).
-- Moves that data into a governed lakehouse on a schedule, using three Airflow pipelines for ingestion, transformation, and a weekly model retrain.
-- Organizes raw data into clean, analysis-ready tables through progressive layers (raw, cleaned, business-ready), built with Databricks and dbt. Every layer has automated tests.
-- Matches every authorization to its eventual settlement and flags the ones that never get one. Payment discrepancies surface automatically instead of getting buried.
-- Keeps a running history of merchant details with a dbt snapshot, so past values stay queryable even after a merchant's name or category changes.
-- Blocks bad data from reaching the model with an automated quality gate. It halts the pipeline if key metrics fall outside expected ranges.
-- Flags fraud with two methods running together, fast deterministic rules and a machine learning model. Every model version gets tracked and promoted through MLflow.
-- Serves live fraud scores over a FastAPI endpoint. If the model registry goes down, the API stays up and reports itself as degraded instead of crashing.
-- Displays pipeline health and fraud-detection results on a live Streamlit dashboard.
+### Data Pipeline
 
-## Tech stack
+- Transaction data ingestion using Kafka
+- Workflow orchestration with Airflow
+- Data transformation using dbt
+- Data processing with Databricks
 
-- **Streaming:** Kafka 3.9 (KRaft, no ZooKeeper), confluent-kafka 2.6.1
-- **Orchestration:** Airflow 3.3.1, TaskFlow API, asset-based cross-DAG scheduling
-- **Lakehouse:** Databricks Free Edition, Delta Lake, Unity Catalog (catalog/schema/volume)
-- **Transformation:** dbt-databricks 1.9.4 / dbt-core 1.12.2 (medallion models, snapshot, tests)
-- **Quality:** Great Expectations 1.20.0 (batch checkpoint gate)
-- **ML/MLOps:** scikit-learn 1.9.0 (Isolation Forest), MLflow 3.15.1 (tracking + UC model registry)
-- **Serving:** FastAPI 0.115.6, Pydantic 2.10.4, Streamlit 1.41.1
-- **Infrastructure:** Docker Compose, Postgres 16 (Airflow metadata), Databricks SDK / SQL connector
+### Data Quality
 
+- Schema and data validation using Great Expectations
+- Validation checks before downstream model processing
 
-## Setup and run
+### Machine Learning
 
-**Prerequisites:** Docker Desktop, Python 3.11+ (for local producer/tests), a Databricks Free Edition workspace.
+- Fraud classification models
+- Evaluation using precision, recall, F1, and PR-AUC
+- Model experiment tracking with MLflow
+- Hybrid model evaluation
 
-**1. Environment**
+### Model Serving
+
+- REST API for fraud predictions using FastAPI
+- Streamlit dashboard for viewing model results
+
+## Project Structure
+
 ```
-cp .env.example .env
-# fill in DATABRICKS_HOST, DATABRICKS_HTTP_PATH, DATABRICKS_TOKEN, DATABRICKS_TRAINING_JOB_ID
+airflow/       Airflow configuration
+api/            FastAPI application
+dashboard/      Streamlit dashboard
+dags/           Airflow DAGs
+dbt/            dbt models and tests
+notebooks/      Model development and analysis
+quality/        Data quality checks
+tests/          Project test
 ```
-
-**2. Databricks workspace setup**
-- Create catalog `fraud` with schemas `bronze`, `silver`, `gold`
-- Create UC Volume `fraud.bronze.landing` (the Kafka to Bronze bridge's landing zone)
-- Create a serverless SQL warehouse and copy its HTTP path into `DATABRICKS_HTTP_PATH`
-- Generate a personal access token for `DATABRICKS_TOKEN`
-- Import `notebooks/train_isolation_forest.py` into the workspace, create a Job (Workflows → Create job → Notebook task) pointing at it, and copy the job ID into `DATABRICKS_TRAINING_JOB_ID`
-
-**3. Bring up the local stack**
-```
-docker compose up -d
-```
-
-**4. Generate initial data**
-```
-pip install -r requirements.txt
-python producer.py --time-compression 60 --count 5000
-```
-Then unpause `ingest_transactions` in the Airflow UI (runs every 15 min, or trigger manually). Its success feeds `transform_quality` via an asset dependency.
-
-**5. Access points**
-| Service | URL |
-|---|---|
-| Kafka UI | http://localhost:8080 |
-| Airflow UI | http://localhost:8081 (admin/admin) |
-| FastAPI | http://localhost:8082 (`/docs` for OpenAPI) |
-| Streamlit dashboard | http://localhost:8083 |
-
-## Model performance
-
-Numbers below come from holdout evaluation. They compare the Isolation Forest alone, the three rules alone, and both together.
-
-**Recall by fraud type**
-
-| fraud_type | Rules only | Model only | Hybrid |
-|---|---|---|---|
-| velocity | 0.623 | 0.255 | 0.642 |
-| geo_impossible | 0.533 | 0.111 | 0.533 |
-| amount_anomaly | 0.737 | 0.684 | 0.737 |
-
-**Overall**
-
-| | Precision | Recall | FPR |
-|---|---|---|---|
-| Rules only | 0.867 | 0.612 | 0.005 |
-| Model only | 0.495 | 0.265 | 0.013 |
-| Hybrid | 0.646 | 0.624 | 0.016 |
-
-Hybrid recall matches rules-only on geo_impossible and amount_anomaly. The model doesn't add anything there. On velocity it does better, 0.642 versus 0.623 for rules alone. That's because the model catches burst rows before `txn_count_1h` crosses the rule's threshold. It's the entire source of hybrid's overall recall gain, from 0.612 up to 0.624. The cost is precision, which drops from 0.867 to 0.646 as the model adds its own false positives.
-
