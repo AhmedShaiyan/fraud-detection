@@ -19,16 +19,6 @@ An end-to-end fraud detection pipeline covering data ingestion, transformation, 
 
 The project implements a data pipeline for detecting fraudulent transactions. It combines data engineering, machine learning, and model serving components.
 
-The pipeline includes:
-
-- Kafka for data ingestion
-- Airflow for workflow orchestration
-- Databricks for data processing
-- dbt for data transformation
-- Great Expectations for data validation
-- MLflow for experiment tracking
-- FastAPI for model serving
-- Streamlit for visualization
 
 ## Technologies Used
 
